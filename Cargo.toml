@@ -2,7 +2,7 @@
 name = "duplodocus"
 version = "0.1.0"
 edition = "2021"
-
+repository = "https://github.com/allenai/duplodocus"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
@@ -31,3 +31,8 @@ ahash = "0.8.11"
 mj_io = "0.1.7"
 num-traits = "0.2.19"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
