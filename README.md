@@ -40,7 +40,7 @@ This tool provides four deduplication strategies optimized for different dataset
 
 ### AWS EC2 Setup (Optional)
 
-For large-scale processing on AWS i4i instances with NVMe drives:
+For large-scale processing on AWS i4i/i7i instances with NVMe drives:
 
 ```bash
 # Configure RAID0 array from NVMe drives
@@ -70,7 +70,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source ~/.bashrc
 
 # Clone and build
-git clone https://github.com/yourusername/dedup-tool.git
+git clone git@github.com:allenai/duplodocus.git
 cd dedup-tool
 cargo build --release
 
