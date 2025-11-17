@@ -1,19 +1,29 @@
 # A Primer on Minhash Theory and Engineering
 
-Leveraging the MinHash algorithm for identifying and removing duplicates in large-scale text datasets has become a standard step in the curation of LLM pretraining datasets. We've been largely dissatisfied with the existing open-source deduplication frameworks, motivating the release of this package. One could easily just press the buttons and learn the tooling (as outlined in the essential_case_study), but it's also a bit helpful to understand a bit of the theory and engineering behind how an efficient large-scale minhash implementation might work. 
+Leveraging the MinHash algorithm for identifying and removing duplicates in large-scale text datasets has become a standard step in the curation of LLM pretraining datasets. We've been largely dissatisfied with the existing open-source deduplication frameworks, motivating the release of this package. One could easily just press the buttons and learn the tooling, but it's also a bit helpful to understand a bit of the theory and engineering behind how an efficient large-scale minhash implementation might work. 
 
 ## The basics: Minhash in Theory
 
 ### The simplest minhash
 First we define what we'll call a "duplicate", with respect to a text dataset. Minhash can be thought of as a set-similarity locality-sensitive hashing scheme: that is, if provided a collection of **sets**, we can determine which sets are "similar" in a Jaccard similarity sense. The Jaccard similarity of two sets, A, and B, is defined as the size of their intersection divided by the size of their union:
-$$ J(A,B) := \frac{|A \cap B|}{|A \cup B|}.$$
+
+$$
+J(A,B) := \frac{|A \cap B|}{|A \cup B|}.
+$$
+
 Intuitively, if A=B, then this is 1.0; if A and B are disjoint, then this is 0.0; and if A and B share some elements, then this is somewhere in between. **We will define two sets as "fuzzy duplicates" if they have a Jaccard similarity greater than some threshold $T$.**
 
 Consider these two hypothetical sets, A and B. Minhash provides a hash signature $S_A$, $S_B$ such that the probability of these two signatures being equal is equivalent to the Jaccard similarity of A and B:
+
+
 $$ P[S_A=S_B] = J(A,B) $$
+
+
 where we're hiding that the probability here refers to which specific hash function (from a large family of hash functions) we use to generate $S_A$ and $S_B$. 
 
 Specifically the way that this works is to pick a hash function $h: X \rightarrow U$, which operates on elements of $A, B$,  mapping them into some universe that has a total ordering (say... integers). The minhash signature we'd get from set $A$ would be the minimum hash value of all its elements:
+
+
 $$S_A := \min_{x\in A} h(x).$$
 
 It is not too hard to see that this signature scheme satisfies the desired condition that $ P[S_A=S_B] = J(A,B) $. Assuming a sufficiently good hash function (read: collision-free), the only way for $S_A$ to equal $S_B$, would be if they share the minimum element: in other words, amongst all the elements in $A \cup B$, the minimum element lives in $A \cap B$, which happens with probability $J(A,B)$. Indeed, this is an if-and-only-if relationship: $S_A = S_B$ if and only if $argmin_{x\in A\cup B} \in A\cap B$. The reverse direction is trivial, and the forward direction follows by a quick contrapositive argument. 
@@ -23,13 +33,18 @@ This simple single-hash scheme leaves two open questions: 1) This seems very hig
 
 ### Amplifying the signal
 First we answer the question of variance. It's helpful to keep in mind that for a Bernoulli random variable with probability $p$, the variance is $p\cdot(1-p)$. For the purposes of identifying "fuzzy duplicates", or sets that are mostly similar, we can set a Jaccard similarity threshold, $T$: we care less about actually calculating the Jaccard similarity between any two sets, but instead about identifying with a high degree of confidence sets that two sets have Jaccard similarity $\geq T$. In our current schema, the probability of linking sets $A$ and $B$ can only be attained by our minhash signal, which fires with probability $J(A,B)$. It's helpful to consider graphs as follows with $J(A,B)$ on the x-axis, and the probability of a "minhash collision" on the y-axis. In the single-hash setting, this graph is the identity function. An ideal curve here would look like the Heaviside step function:
+
 $$ P[\text{minhash collision}] = \begin{cases} 
       0 & J(A,B) < T \\
       1 & J(A,B) \geq T 
    \end{cases}.
 $$
+
 A standard way to amplify this would be to use multiple independent hash functions, and then report a minhash-collision only if all minhash signatures are equal. The probability that this occurs would be $J(A,B)^k$, which sharpens the curve, but also "pushes it to the right". To allow more control over the threshold, one consider minhashing in a 2-dimensional way. Suppose we have $m \times k$ independent hash functions. For any set, we can generate a signature for each of these hash functions, which we arrange in an $m \times k$ matrix, yielding a "signature matrix" for each set. We can say that any two sets have a minhash collision if for any $j \leq m$, the $j^{th}$ rows of their signature matrices are equal. Any one row is equal with probability $J(A,B)^k$, and the probability that at least one row of the $m$ rows is equal is 
-$$P[\text{collision}] = 1 - (1-J(A,B)^k)^m.$$ Intuitively, this makes the curve less sharp while also shifting it slightly to the left. 
+
+$$P[\text{collision}] = 1 - (1-J(A,B)^k)^m.$$ 
+
+Intuitively, this makes the curve less sharp while also shifting it slightly to the left. 
 
 ### Multidocument cases
 Next we answer the question of how to handle multiple documents. Returning to the single-hash setting, if we had a collection $\mathcal{X} := \{X_1, X_2, ..., X_n\}$, and applied a single minhash function all of these, yielding signatures $\{S_1, S_2, ..., S_n\}$, we could partition the sets according to signature-equality. This suggests that any two elements within a group have sufficiently large Jaccard similarity. It's helpful to think of this from a graph perspective: if each set $X_i$ represents a node in a graph, then we can draw an edge between $X_i$ and $X_j$ if $S_i=S_j$. This yields a graph that can be thought of as a union of disjoint cliques. 
