@@ -29,7 +29,8 @@ use anyhow::{Error, Result};
 use dashmap::DashMap;
 use glob::glob;
 use mj_io::{
-    build_pbar, expand_dirs, get_output_filename, read_pathbuf_to_mem, write_mem_to_pathbuf, read_pathbuf, create_writer
+    build_pbar, create_writer, expand_dirs, get_output_filename, read_pathbuf, read_pathbuf_to_mem,
+    write_mem_to_pathbuf,
 };
 use ndarray::Array1;
 use rand::Rng;
@@ -229,9 +230,12 @@ impl OmniTokenizer {
                     hasher.finish() as usize
                 })
                 .collect(),
-            "bytes" => {text.bytes().map(|b| b as usize).collect()}
+            "bytes" => text.bytes().map(|b| b as usize).collect(),
             _ => {
-                panic!("Unknown tokenizer: '{}'. Supported tokenizers are p50k, cl100k, uniseg, bytes", self.tokenizer_name);
+                panic!(
+                    "Unknown tokenizer: '{}'. Supported tokenizers are p50k, cl100k, uniseg, bytes",
+                    self.tokenizer_name
+                );
             }
         }
     }
@@ -1258,8 +1262,9 @@ fn clean_path(
                 let mut line_json: JSONValue = serde_json::from_str(&line).unwrap();
                 let anno_value = get_anno_value((cc_id, cc_size, cc_idx));
                 json_set(&mut line_json, &annotate_key.clone(), anno_value).unwrap();
-                writer.write_line(&serde_json::to_vec(&line_json).unwrap()).unwrap();
-
+                writer
+                    .write_line(&serde_json::to_vec(&line_json).unwrap())
+                    .unwrap();
             } else {
                 // Otherwise just write the line
                 writer.write_line(&line.as_bytes().to_vec()).unwrap();
@@ -1269,7 +1274,6 @@ fn clean_path(
             writer.write_line(&line.as_bytes().to_vec()).unwrap();
         }
     }
-
 
     Ok((lines_seen, lines_removed))
 }

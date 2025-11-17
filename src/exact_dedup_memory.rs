@@ -36,9 +36,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use xxhash_rust::xxh3::{xxh3_128, xxh3_64};
 
 use crate::utils::{json_get, json_set};
-use mj_io::{
-    build_pbar, expand_dirs, get_output_filename, read_pathbuf, create_writer,
-};
+use mj_io::{build_pbar, create_writer, expand_dirs, get_output_filename, read_pathbuf};
 use std::time::Instant;
 /*
 EXACT DEDUPLICATION MODULE
@@ -306,17 +304,20 @@ fn exact_dedup_file<K: DocHash>(
             let anno_data = json!({"hash": hash_val.to_json(),
 			 					   "num_dups": *count});
             json_set(&mut line_json, &annotate_key, anno_data).unwrap();
-            writer.write_line(&serde_json::to_vec(&line_json).unwrap()).unwrap();
+            writer
+                .write_line(&serde_json::to_vec(&line_json).unwrap())
+                .unwrap();
         } else {
             let count = *counter.entry(hash_val).and_modify(|c| *c += 1).or_insert(1);
             if count == 1 {
                 kept += 1;
-                writer.write_line(&serde_json::to_vec(&line_json).unwrap()).unwrap();
+                writer
+                    .write_line(&serde_json::to_vec(&line_json).unwrap())
+                    .unwrap();
             }
         }
     }
     writer.finish().unwrap();
-
 
     Ok((seen, kept))
 }

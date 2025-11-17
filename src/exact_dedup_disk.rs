@@ -54,9 +54,7 @@ use crate::storage::GenWriter;
 use crate::utils::{json_get, json_set};
 use anyhow::{anyhow, Error, Result};
 use dashmap::DashMap;
-use mj_io::{
-    build_pbar, expand_dirs, get_output_filename, read_pathbuf, create_writer
-};
+use mj_io::{build_pbar, create_writer, expand_dirs, get_output_filename, read_pathbuf};
 use rand::Rng;
 use rayon::prelude::*;
 use regex::Regex;
@@ -435,7 +433,7 @@ fn prune_group(
         })
     }
     vlist.par_iter().for_each(|p| {
-        let contents = read_pathbuf(p, true).unwrap();        
+        let contents = read_pathbuf(p, true).unwrap();
         let output_filename = get_output_filename(&p, storage_dir, output_dir).unwrap();
         let mut writer = create_writer(&output_filename).unwrap();
         for line in contents.lines() {
@@ -447,14 +445,18 @@ fn prune_group(
                 let anno_data = json!({"hash": hash_val,
 			 					       "num_dups": *count});
                 json_set(&mut line_json, &anno, anno_data).unwrap();
-                writer.write_line(&serde_json::to_vec(&line_json).unwrap()).unwrap();
+                writer
+                    .write_line(&serde_json::to_vec(&line_json).unwrap())
+                    .unwrap();
             } else {
                 let count = *counter
                     .entry(hash_val.clone())
                     .and_modify(|c| *c += 1)
                     .or_insert(1);
                 if count == 1 {
-                    writer.write_line(&serde_json::to_vec(&line_json).unwrap()).unwrap();
+                    writer
+                        .write_line(&serde_json::to_vec(&line_json).unwrap())
+                        .unwrap();
                 }
             }
         }

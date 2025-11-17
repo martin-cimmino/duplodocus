@@ -1,5 +1,5 @@
-use std::fs;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::io::BufRead;
 use std::path::PathBuf;
@@ -65,7 +65,8 @@ pub fn true_jaccard(
             remove_duplicates: Some(false),
         },
     };
-    let delete_while_cleaning = delete_while_cleaning.unwrap_or(overrides.output_params.delete_while_cleaning.unwrap());
+    let delete_while_cleaning =
+        delete_while_cleaning.unwrap_or(overrides.output_params.delete_while_cleaning.unwrap());
 
     let hotnode_size = hotnode_size.unwrap_or(usize::MAX);
     let hotnode_dir = hotnode_dir.unwrap_or_else(|| output_dir.clone());
@@ -379,8 +380,8 @@ fn par_annotate(
     uf: &UFRush,
     annotate_key: &String,
 ) -> Result<(Vec<JSONValue>, usize), Error> {
-    // Pairs are like [(uf_index/id, doc), ...]     
-    let flat_with_indices: Vec<(usize, JSONValue)> = docs 
+    // Pairs are like [(uf_index/id, doc), ...]
+    let flat_with_indices: Vec<(usize, JSONValue)> = docs
         .into_par_iter()
         .enumerate()
         .flat_map_iter(|(group_idx, inner_vec)| {
@@ -407,9 +408,7 @@ fn par_annotate(
     let parent_doc_pairs: Vec<(usize, usize)> = parent_lookup
         .par_iter()
         .enumerate()
-        .filter_map(|(doc_idx, parent_opt)| {
-            parent_opt.map(|parent| (parent, doc_idx))
-        })
+        .filter_map(|(doc_idx, parent_opt)| parent_opt.map(|parent| (parent, doc_idx)))
         .collect();
 
     // Group by parent using parallel fold + reduce (no race conditions!)
@@ -420,7 +419,7 @@ fn par_annotate(
             |mut acc: HashMap<usize, Vec<usize>>, (parent, doc_idx)| {
                 acc.entry(parent).or_default().push(doc_idx);
                 acc
-            }
+            },
         )
         .reduce(
             || HashMap::new(),
@@ -429,37 +428,43 @@ fn par_annotate(
                     acc1.entry(parent).or_default().append(&mut docs);
                 }
                 acc1
-            }
+            },
         );
 
     // Map doc_idx -> cc_idx
     let cc_idx_array: DashMap<usize, usize> = DashMap::new();
-    parent_groups.into_par_iter().for_each(|(_parent, mut indices)| {
-        // Sort to ensure consistent ordering
-        indices.sort_unstable();
-        for (cc_idx, &doc_idx) in indices.iter().enumerate() {
-            cc_idx_array.insert(doc_idx, cc_idx);
-        }
-    });
+    parent_groups
+        .into_par_iter()
+        .for_each(|(_parent, mut indices)| {
+            // Sort to ensure consistent ordering
+            indices.sort_unstable();
+            for (cc_idx, &doc_idx) in indices.iter().enumerate() {
+                cc_idx_array.insert(doc_idx, cc_idx);
+            }
+        });
 
     let remove_count = AtomicUsize::new(0);
-    let new_docs: Vec<JSONValue> = flat_with_indices 
+    let new_docs: Vec<JSONValue> = flat_with_indices
         .into_par_iter()
         .enumerate()
         .map(|(doc_idx, (_, mut obj))| {
             if let Some(parent) = parent_lookup[doc_idx] {
-                let cc_id = *cc_id_lookup.get(&parent).unwrap(); 
+                let cc_id = *cc_id_lookup.get(&parent).unwrap();
                 let cc_size = *cc_size.get(&parent).unwrap();
                 let cc_idx = *cc_idx_array.get(&doc_idx).unwrap();
                 if cc_idx > 0 {
                     remove_count.fetch_add(1, Ordering::Relaxed);
                 }
-                json_set(&mut obj, annotate_key,
-                    json!({"cc_id": cc_id, "cc_size": cc_size, "cc_idx": cc_idx}))
-                    .unwrap();
+                json_set(
+                    &mut obj,
+                    annotate_key,
+                    json!({"cc_id": cc_id, "cc_size": cc_size, "cc_idx": cc_idx}),
+                )
+                .unwrap();
             }
             obj
-        }).collect();
+        })
+        .collect();
     Ok((new_docs, remove_count.into_inner()))
 }
 
@@ -478,40 +483,39 @@ fn write_docs(
             bytes
         })
         .collect();
-    
+
     // Parallel: Group into chunks (just indices)
     let mut idx_groups: Vec<Vec<usize>> = Vec::new();
 
     let mut cur_group: Vec<usize> = Vec::new();
     let mut cur_size = 0;
-    for (i,v) in serialized.iter().enumerate() {
-    	let len = v.len();
-    	cur_group.push(i);
-    	cur_size += len;
-    	if cur_size >= OUTPUT_FILE_SIZE {
+    for (i, v) in serialized.iter().enumerate() {
+        let len = v.len();
+        cur_group.push(i);
+        cur_size += len;
+        if cur_size >= OUTPUT_FILE_SIZE {
             idx_groups.push(std::mem::take(&mut cur_group));
-    		cur_size = 0;
-    	}    	
+            cur_size = 0;
+        }
     }
     if cur_group.len() > 0 {
-    	idx_groups.push(cur_group)
+        idx_groups.push(cur_group)
     }
 
     idx_groups.into_par_iter().for_each(|group| {
-
         let output_file = output_dir.clone().join(format!(
             "{}_file_{:08}.jsonl.zst",
             prefix,
-            counter.fetch_add(1, Ordering::SeqCst)));
-	    let total_size: usize = group.iter().map(|&i| serialized[i].len()).sum();
-	    let mut contents = Vec::with_capacity(total_size);	    
-	    for &i in &group {
-	        contents.extend_from_slice(&serialized[i]);
-	    }        
+            counter.fetch_add(1, Ordering::SeqCst)
+        ));
+        let total_size: usize = group.iter().map(|&i| serialized[i].len()).sum();
+        let mut contents = Vec::with_capacity(total_size);
+        for &i in &group {
+            contents.extend_from_slice(&serialized[i]);
+        }
         write_mem_to_pathbuf(&contents, &output_file).unwrap();
     });
 
-    
     Ok(())
 }
 
