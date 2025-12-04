@@ -21,7 +21,7 @@ regex = "1.10.4"
 ndarray = "0.15.6"
 rand_chacha = "0.3.1"
 sha2 = "0.9"
-bytemuck = "1.16.0"
+bytemuck = {version = "1.16.0", features = ["extern_crate_alloc"]}
 dashmap = { version = "5.5.3", features = ["rayon"] }
 rayon = "1.10.0"
 byteorder = "1.5.0"
@@ -31,6 +31,9 @@ ahash = "0.8.11"
 mj_io = "0.1.7"
 num-traits = "0.2.19"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
+gjson = "0.8.1"
+smallvec = "1.15.1"
+
 
 # The profile that 'dist' will build with
 [profile.dist]

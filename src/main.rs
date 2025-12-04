@@ -86,6 +86,7 @@
 //! ```
 
 // External crates
+use crate::sa_base::alternative_merge;
 use clap::{Parser, Subcommand};
 
 // Standard library
@@ -100,6 +101,7 @@ use crate::minhash_disk::{
 };
 use crate::minhash_memory::minhash_memory;
 use crate::true_jaccard::true_jaccard;
+use crate::sa_base::{make_sa_tables_cmd, pq_serial, merge_matches, sa_annotate_files};
 
 pub mod exact_dedup_disk;
 pub mod exact_dedup_memory;
@@ -111,7 +113,10 @@ pub mod storage;
 pub mod true_jaccard;
 pub mod uf_rush2;
 pub mod utils;
-
+pub mod sa_base;
+// pub mod bitpack_vec;
+pub mod table_old;
+// pub mod table_new;
 /* 4 basic use cases here:
 {Exact, Fuzzy} x {Memory, Disk} deduplication:
 
@@ -693,6 +698,75 @@ enum Commands {
         #[arg(long)]
         delete_while_cleaning: Option<bool>,
     },
+    #[clap(arg_required_else_help = true)]
+    SaMakeTables {
+        #[arg(required=true, long)]
+        input_dir: PathBuf,
+
+        #[arg(required=true, long)]
+        output_dir: PathBuf,        
+
+        #[arg(long)]
+        config: Option<PathBuf>,         
+
+        #[arg(long)]
+        file_map: Option<PathBuf>,
+
+        #[arg(long)]
+        tokenizer: Option<String>,
+
+        #[arg(long)]
+        max_lines_per_path: Option<usize>,
+
+        #[arg(long)]
+        text_key: Option<String>,
+    },
+
+    #[clap(arg_required_else_help = true)]
+    SaPqSerial {
+        #[arg(required=true, long)]
+        storage_dir: PathBuf,    
+
+        #[arg(long, default_value_t=500)]
+        match_length: usize
+    },
+
+    #[clap(arg_required_else_help = true)]
+    SaMergeMatches {
+        #[arg(required=true, long)]
+        storage_dir: PathBuf,      
+
+        #[arg(long, default_value_t=500)]
+        match_length: usize
+    },
+
+    #[clap(arg_required_else_help = true)]
+    SaAnnotate {
+        #[arg(required=true, long)]
+        input_dir: PathBuf,   
+
+        #[arg(required=true, long)]
+        storage_dir: PathBuf,   
+
+        #[arg(required=true, long)]
+        output_dir: PathBuf,   
+
+        #[arg(required=true, long)]
+        annotate_key: String,                                   
+    },
+
+    #[clap(arg_required_else_help=true)]
+    SaAlt {
+        #[arg(required=true, long)]
+        text: PathBuf,
+
+        #[arg(required=true, long)]
+        sa_table: PathBuf,
+
+        #[arg(long, default_value_t=500)]
+        match_length: usize
+    }
+
 }
 
 /*=================================================================
@@ -896,8 +970,34 @@ fn main() {
             id_offset.clone(),
             delete_while_cleaning.clone(),
         ),
+        Commands::SaMakeTables {
+            input_dir,
+            output_dir,
+            config,
+            file_map,
+            tokenizer,
+            max_lines_per_path,
+            text_key
+        } => make_sa_tables_cmd(input_dir, output_dir, config.clone(), file_map.clone(), tokenizer.clone(), max_lines_per_path.clone(), text_key.clone()),
 
+        Commands::SaPqSerial {
+            storage_dir, match_length 
+        } => pq_serial(storage_dir, *match_length),
+
+        Commands::SaMergeMatches {
+            storage_dir, match_length
+        } => merge_matches(storage_dir, *match_length),
+
+        Commands::SaAnnotate {
+            input_dir, storage_dir, output_dir, annotate_key
+        } => sa_annotate_files(input_dir, storage_dir, output_dir, annotate_key),
+
+        Commands::SaAlt {
+            text, sa_table, match_length
+        } => alternative_merge(text, sa_table, *match_length),
+        
         _ => Ok(()),
     };
     result.unwrap()
+
 }
