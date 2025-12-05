@@ -1,9 +1,9 @@
 
+use ahash::HashMap;
 use crate::utils::json_set;
 use serde_json::json;
 use serde_json::Value;
 use std::io::BufRead;
-use std::collections::HashMap;
 use std::fs::create_dir_all;
 use std::os::unix::fs::OpenOptionsExt;
 use std::fs::OpenOptions;
@@ -34,7 +34,6 @@ use gjson;
 
 use std::collections::BinaryHeap;
 use std::cmp::Ordering as StdOrdering;
-use smallvec::SmallVec;
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::{__m256i, _mm256_loadu_si256, _mm256_cmpeq_epi8, _mm256_movemask_epi8};
@@ -293,6 +292,131 @@ pub fn pq_serial(storage_dir: &PathBuf,
 	And open stream readers from SA tables
 	*/
 	let start_main = Instant::now();
+	let text_lookup = make_text_lookups(storage_dir).unwrap();
+	let total_counts:usize = text_lookup.iter().map(|v| v.len()).sum();	
+	let mut table_streams = make_table_streams(storage_dir, &text_lookup).unwrap();
+
+	let mut stream_iterators: HashMap<usize, TextIterator> = HashMap::default();
+
+	table_streams.iter_mut().for_each(|s| {
+		stream_iterators.insert(s.source, s.text_iter(match_length));
+	});
+
+
+	/* Step 2: Initialize min-order data structure 
+	*/
+
+	let mut pq: BinaryHeap<Reverse<TreeNode>> = BinaryHeap::new();
+	for (source, iterator) in stream_iterators.iter_mut() {
+		if let Some(node) = iterator.next() {
+			let node = node.unwrap();
+			pq.push(Reverse(node));
+		}
+	}
+	if pq.len() == 0 {
+		return Ok(());
+	}
+
+	// Pop one out and put one back from its stream
+	let mut prev_min = pq.pop().unwrap().0;
+	let prev_min_source = prev_min.source;
+	if let Some(node) = stream_iterators.get_mut(&prev_min_source).unwrap().next() {
+		let node = node.unwrap();
+		pq.push(Reverse(node));
+	}
+
+
+	/* Step 3: Now do the loop 
+	*/
+	let match_writer = MatchWriter::new(&storage_dir.clone().join("matches")).unwrap();
+	let match_count = AtomicUsize::new(0);
+	let mut currently_in_a_run = false;
+	while pq.len() > 0 {
+		let cur_min = pq.pop().unwrap().0;
+		if cur_min == prev_min {		
+			if !currently_in_a_run {
+				match_writer.write(prev_min.source, &prev_min.sa_value.to_le_bytes()).unwrap();
+				match_count.fetch_add(1, Ordering::SeqCst);
+			}
+			match_writer.write(cur_min.source, &cur_min.sa_value.to_le_bytes()).unwrap();
+			match_count.fetch_add(1, Ordering::SeqCst);
+			currently_in_a_run = true;
+		} else {
+			currently_in_a_run = false;
+		}
+		if let Some(node) = stream_iterators.get_mut(&cur_min.source).unwrap().next() {
+			pq.push(Reverse(node.unwrap()));
+		}
+		prev_min = cur_min;		
+	}
+	
+	match_writer.finish().unwrap();
+
+	println!("Finished PQ in {:?} secs | found {:?} matches", start_main.elapsed().as_secs(), match_count.into_inner());
+	Ok(())
+}
+
+
+pub fn pq_serial_old(storage_dir: &PathBuf,
+				 match_length: usize) -> Result<(), Error> {
+	/* Step 1: 
+	Load into memory:
+		- file map
+		- global offset file 
+		- all text files
+		- all offset files
+	And open stream readers from SA tables
+	*/
+	let start_main = Instant::now();
+	let text_lookup = make_text_lookups(storage_dir).unwrap();
+	let total_counts:usize = text_lookup.iter().map(|v| v.len()).sum();	
+	let mut table_streams = make_table_streams(storage_dir, &text_lookup).unwrap();
+	let pbar = build_pbar(total_counts, "Count.len");
+	let mut stream_iterators: HashMap<usize, TextIterator> = HashMap::default();
+
+	table_streams.iter_mut().for_each(|s| {
+		stream_iterators.insert(s.source, s.text_iter(match_length));
+	});
+
+
+	/* Step 2: Initialize min-order data structure 
+	*/
+
+	let mut loser_tree = LoserTree::new(stream_iterators);
+	let match_writer = MatchWriter::new(&storage_dir.clone().join("matches")).unwrap();
+	let match_count = AtomicUsize::new(0);
+	let prev_min = loser_tree.pop().unwrap();
+	if prev_min == None {
+		return Ok(());
+	}
+
+	let mut prev_min = prev_min.unwrap();
+	let mut currently_in_a_run = false;
+	while !loser_tree.peek().is_none() {
+		let cur_min = loser_tree.pop().unwrap().unwrap();
+		if cur_min == prev_min {
+			if !currently_in_a_run {
+				match_writer.write(prev_min.source, &prev_min.sa_value.to_le_bytes()).unwrap();
+				match_count.fetch_add(1, Ordering::SeqCst);
+			}
+			match_writer.write(cur_min.source, &cur_min.sa_value.to_le_bytes()).unwrap();
+			match_count.fetch_add(1, Ordering::SeqCst);
+			currently_in_a_run = true;
+		} else {
+			currently_in_a_run = false;
+		}
+		prev_min = cur_min;
+		// pbar.inc(1);
+	}
+	match_writer.finish().unwrap();
+	println!("Finished PQ in {:?} secs | found {:?} matches ", start_main.elapsed().as_secs(), match_count.into_inner());
+	Ok(())
+}
+
+
+
+fn make_text_lookups(storage_dir: &PathBuf) -> Result<Vec<Vec<u8>>, Error> {
+	// Creates a lookup from idx -> text
 	let text_pattern = storage_dir.clone().join("text").join("text_part_*");
 	let text_objects: Vec<PathBuf> = glob(&text_pattern.to_str().unwrap()).unwrap().into_iter().map(|p| p.unwrap()).collect();
 	let max_text_idx = AtomicUsize::new(0);
@@ -304,83 +428,24 @@ pub fn pq_serial(storage_dir: &PathBuf,
 	let mut text_lookup: Vec<Vec<u8>> = vec![Vec::new(); max_text_idx.into_inner() + 1];
 	text_data.into_iter().for_each(|(idx, v)| {text_lookup[idx] = v});
 
+	Ok(text_lookup)
+}
 
+
+
+
+fn make_table_streams<'stream, 'a>(storage_dir: &PathBuf, text_lookup: &'a Vec<Vec<u8>>) -> Result<Vec<SAStream<'a>>, Error> {
 	let table_pattern = storage_dir.clone().join("table").join("table_part_*");
 	let table_objects: Vec<PathBuf> = glob(&table_pattern.to_str().unwrap()).unwrap().into_iter().map(|p| p.unwrap()).collect();
-	let max_table_idx = AtomicUsize::new(0);
-	let table_data: Vec<(usize, FileStream)> = table_objects.into_iter().map(|p| { //PAR
-		let table_idx = get_part_num(&p).unwrap();		
-		max_table_idx.fetch_max(table_idx, Ordering::SeqCst);
-		(table_idx, FileStream::new(&p, 16384).unwrap())
+		
+	let table_streams: Vec<SAStream> = table_objects.into_par_iter().map(|p| {
+		let table_idx = get_part_num(&p).unwrap();
+		let stream = SAStream::new(&p, text_lookup[table_idx].as_slice(), table_idx, 16384).unwrap();
+		stream
 	}).collect();
-	let mut table_lookup: Vec<Option<FileStream>> =(0..(max_table_idx.into_inner() + 1)).into_iter().map(|_| None).collect();
-	table_data.into_iter().for_each(|(idx,v)| {table_lookup[idx] = Some(v)});
 
-	/* Step 2:
-	Create priority queue to have 2 indices from each stream 
-	*/
-	let total_counts:usize = text_lookup.iter().map(|v| v.len()).sum();
-	//let pbar = build_pbar(total_counts, "Items");
+	Ok(table_streams)
 
-
-	let mut pq: BinaryHeap<Reverse<QueueElement>> = BinaryHeap::new();
-	for (idx, table_opt) in table_lookup.iter_mut().enumerate() {
-
-		if let Some(table) = table_opt {
-			for _ in 0..2 {
-				let cur_text = &text_lookup[idx];
-				if let Some((table_value, sv)) = table.get_next_text(cur_text, match_length).unwrap() {
-					let pqe = QueueElement{stream: idx, 
-										   idx: table_value,
-										   cmp_bytes: sv};
-					pq.push(std::cmp::Reverse(pqe));
-				}				
-			}
-		}
-	}
-
-	/* Step 3:
-	While the PQ is not empty: 
-		- look at the minimum two elements
-		- look up their strings and count how many indices they have in common
-		- if they have >= match_length in common, write to output streamer
-	*/
-	let match_writer = MatchWriter::new(&storage_dir.clone().join("matches")).unwrap();
-	let mut last_written: (usize, u64) = (usize::MAX, u64::MAX);
-	let match_count = AtomicUsize::new(0);
-	while pq.len() > 1 {
-
-		let min_el = pq.pop().unwrap();
-		//pbar.inc(1);
-		let peek_min = pq.peek().unwrap();
-		if min_el == *peek_min {
-			if last_written != (min_el.0.stream, min_el.0.idx) {
-				let min_idx_bytes = min_el.0.idx.to_le_bytes();
-				match_writer.write(min_el.0.stream, &min_idx_bytes).unwrap();
-				match_count.fetch_add(1, Ordering::SeqCst);
-			} 
-			let peek_min_idx_bytes = peek_min.0.idx.to_le_bytes();
-			match_writer.write(peek_min.0.stream, &peek_min_idx_bytes).unwrap();
-			match_count.fetch_add(1, Ordering::SeqCst);
-
-			last_written = (peek_min.0.stream, peek_min.0.idx);
-		}
-
-		let min_stream = min_el.0.stream;
-		if let Some(ref mut table) = table_lookup[min_stream] {
-			let cur_text = &text_lookup[min_stream];
-			if let Some((table_value, sv)) = table.get_next_text(cur_text, match_length).unwrap() {
-				let pqe = QueueElement{stream: min_stream, 
-									   idx: table_value,
-									   cmp_bytes: sv};
-				pq.push(std::cmp::Reverse(pqe));				
-			}
-		}
-	}
-	match_writer.finish().unwrap();
-
-	println!("Finished PQ in {:?} secs | found {:?} matches", start_main.elapsed().as_secs(), match_count.into_inner());
-	Ok(())
 }
 
 
@@ -390,58 +455,35 @@ pub fn pq_serial(storage_dir: &PathBuf,
 
 pub fn alternative_merge(text_loc: &PathBuf, sa_table_loc: &PathBuf, match_length: usize) -> Result<(), Error> {
 	let start_main = Instant::now();
+	
 	println!("Starting alt flow");
 	let text: Vec<u8> = read_pathbuf_to_mem(text_loc).unwrap().into_inner().into_inner();
 	let text_slice: &[u8] = text.as_slice();
 	//let sa_table: Vec<u64> = read_u64_vec(sa_table_loc).unwrap();
 	//let table_len = sa_table.len();
 	let mut matches: Vec<u64> = Vec::new();
-	let mut sa_table = FileStream::new(sa_table_loc, 16384).unwrap();
-	let (prev_el, prev_text) = sa_table.get_next_text(&text, match_length).unwrap().unwrap();
-	loop {
-		let result = sa_table.get_next_text(&text, match_length).unwrap();
-		if let Some(out_tup) = result {
-			let (cur_el, cur_text) = out_tup;
-			if cur_text == prev_text {
-				if matches.len() > 0 && *matches.last().unwrap() != prev_el as u64 {
-					matches.push(prev_el as u64);				
-				}
-				matches.push(cur_el.try_into().unwrap());
-			}
+	let mut stream = SAStream::new(sa_table_loc, text_slice, 0, 16384).unwrap();
+	let mut text_iterator = stream.text_iter(match_length);
+	let prev_min = text_iterator.next();
+	if prev_min.is_none() {
+		return Ok(())
+	}
+	let mut prev_min = prev_min.unwrap().unwrap();
+	let mut currently_in_a_run = false;
+	for el in text_iterator {
+		let cur_node = el.unwrap();
+		if cur_node == prev_min {
+			if currently_in_a_run {
+				matches.push(prev_min.sa_value);
+			} 
+			matches.push(cur_node.sa_value);
+			currently_in_a_run = true;
 		} else {
-			break;
+			currently_in_a_run = false;
 		}
+		prev_min = cur_node;
+
 	}
-
-	/*
-
-	let mut matches: Vec<u64> = Vec::new();
-
-
-	//let pbar = build_pbar(sa_table.len() -1 , "IDXs");
-
-	let mut prev_el = sa_table[0] as usize;
-	let prev_end = std::cmp::min(prev_el + match_length, table_len) as usize;
-	let mut prev_text = &text_slice[prev_el..prev_end];
-
-
-	for idx in 1..sa_table.len() {
-		let cur_el = sa_table[idx] as usize;
-		let cur_end = std::cmp::min(cur_el + match_length, table_len);
-		let cur_text = &text_slice[cur_el..cur_end];
-
-		if cur_text == prev_text {
-			if matches.len() > 0 && *matches.last().unwrap() != prev_el as u64 {
-				matches.push(prev_el as u64);
-			}
-			matches.push(cur_el.try_into().unwrap());			
-		}
-		prev_el = cur_el;
-		prev_text = cur_text;
-		//pbar.inc(1);
-	}
-	*/
-
 
 	println!("Finished alt flow in {:?} seconds | found {:?} matches", start_main.elapsed().as_secs(), matches.len());
 	Ok(())
@@ -497,8 +539,6 @@ pub fn merge_matches(storage_dir: &PathBuf, match_length: usize) -> Result<(), E
 
 
 pub fn merge_match_path(match_path: PathBuf, offset_path: &PathBuf, merged_match_dir: &PathBuf, match_length: usize, pbar_flag: bool) -> Result<(), Error> {
-
-
 	let mut match_idxs = read_u64_vec(&match_path).unwrap();
 	let offset_trips = read_u64_vec(&offset_path).unwrap();
 	let offset_trips: Vec<(u64, u64, u64)> = offset_trips.chunks_exact(3).map(|c| (c[0], c[1], c[2])).collect(); // (path_id, line_num, idx-ceiling)
@@ -629,22 +669,25 @@ fn sa_annotate_path(input_path: PathBuf, anno_group: &DashMap<usize, Vec<(u64, u
 /*======================================================================
 =                            FILE STREAM STUFF                         =
 ======================================================================*/
-
-struct FileStream {
+struct SAStream<'a> {
     reader: BufReader<File>,
+    text: &'a [u8],
     buffer: Vec<u64>,
     position: usize,
     chunk_size: usize,
+    source: usize, 
 }
 
-impl FileStream {
-    fn new(file: &PathBuf, chunk_size: usize) -> Result<Self, Error> {
-    	let file = File::open(file).unwrap();
+impl<'a> SAStream<'a> {
+    fn new(sa_file: &PathBuf, text: &'a [u8], source: usize, chunk_size: usize) -> Result<Self, Error> {
+    	let open_file = File::open(sa_file).unwrap();
         Ok(Self {        	
-            reader: BufReader::new(file),
+            reader: BufReader::new(open_file),
+            text: text,
             buffer: Vec::with_capacity(chunk_size),
             position: 0,
             chunk_size,
+            source
         })
     }
 
@@ -674,8 +717,18 @@ impl FileStream {
         Ok(!self.buffer.is_empty())
     }
 
+    fn text_iter<'stream>(&'stream mut self, min_len: usize) -> TextIterator<'stream, 'a> {
+    	TextIterator {
+    		stream: self,
+    		min_len
+    	}
+    }
+}
 
-    fn get_next(&mut self) -> Option<Result<u64>> {
+impl<'a> Iterator for SAStream<'a> {
+	type Item = Result<u64, Error>;
+
+	fn next(&mut self) -> Option<Self::Item> {
     	if self.position >= self.buffer.len() {
     		match self.refill_buffer() {
     			Ok(true) => {},
@@ -692,64 +745,36 @@ impl FileStream {
     		None
     	}
     }
-
-    fn get_next_text<'a>(&mut self, text: &'a Vec<u8>, min_len: usize) -> Result<Option<(u64, &'a [u8])>, Error> {
-    	loop {
-    		let next_idx_opt = self.get_next();
-    		if let Some(next_idx) = next_idx_opt {
-    			let next_idx = next_idx.unwrap();
-    			if next_idx as usize + min_len >= text.len() {
-    				continue;
-    			}
-    			let text_slice = text.as_slice();
-    			let slice = &text_slice[next_idx as usize..next_idx as usize + min_len];
-    			//let sv : SmallVec<[u8; 512]> = SmallVec::from_slice(&slice);
-    			return Ok(Some((next_idx, slice)));
-    		} else {
-    			return Ok(None);
-    		}
-    	}
-
-    	Ok(None)
-    }
 }
 
-
-
-/*======================================================================
-=                            PRIORITY QUEUE STUFF                      =
-======================================================================*/
-
-
-
-struct QueueElement<'a> {
-    stream: usize, // which "part" this came from
-    idx: u64, // actual index of the suffix table
-    cmp_bytes: &'a [u8], // suffix that this points to
+pub struct TextIterator<'stream, 'a> {
+	stream: &'stream mut SAStream<'a>,
+	min_len: usize
 }
 
-impl Ord for QueueElement<'_> {
-    fn cmp(&self, other: &Self) -> StdOrdering {
-    	self.cmp_bytes.cmp(&other.cmp_bytes)
-    	//compare_suffix_prefix(self.cmp_bytes, &other.cmp_bytes, self.cmp_bytes.len())
-    }
+impl<'stream, 'a> Iterator for TextIterator<'stream, 'a> {
+	type Item = Result<TreeNode<'a>, Error>;
+	fn next(&mut self) -> Option<Self::Item> {
+		loop {
+			let next_idx_opt = self.stream.next();
+			if let Some(next_idx) = next_idx_opt {
+				let next_idx = next_idx.unwrap();
+				if next_idx as usize + self.min_len >= self.stream.text.len() {
+					continue;
+				}
+				let slice = &self.stream.text[next_idx as usize..next_idx as usize + self.min_len];
+				//let sv : SmallVec<[u8; 512]> = SmallVec::from_slice(&slice);
+				return Some(Ok(TreeNode{sa_value: next_idx,
+										cmp_bytes: slice,
+									    source: self.stream.source,
+										}));
+			} else {
+				return None;
+			}
+		}
+		None
+	}
 }
-
-impl PartialOrd for QueueElement<'_> {
-    fn partial_cmp(&self, other: &Self) -> Option<StdOrdering> {        	
-        Some(self.cmp(other))
-    }
-}
-
-impl PartialEq for QueueElement<'_> {
-    fn eq(&self, other: &Self) -> bool {
-        self.cmp_bytes == other.cmp_bytes
-    }
-}
-
-impl Eq for QueueElement<'_> {}
-
-
 
 
 
@@ -898,3 +923,309 @@ pub fn compare_suffix_prefix(
     // Fallback for remainder or non-SIMD platforms
     slice1.cmp(slice2)
 }
+
+
+/*========================================================
+=                            LOSER TREE STUFF            =
+========================================================*/
+
+
+/// Represents an element in the loser tree along with its source sequence index
+#[derive(Debug, Clone)]
+pub struct TreeNode<'a> {
+    sa_value: u64,
+    cmp_bytes: &'a [u8],
+    source: usize, // which input sequence this came from
+}
+
+impl Ord for TreeNode<'_> {
+    fn cmp(&self, other: &Self) -> StdOrdering {
+        self.cmp_bytes.cmp(&other.cmp_bytes)
+    }
+}
+
+impl PartialOrd for TreeNode<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<StdOrdering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for TreeNode<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp_bytes == other.cmp_bytes
+    }
+}
+
+impl Eq for TreeNode<'_> {}
+
+
+
+/// Loser Tree for efficient k-way merging
+pub struct LoserTree<'a, 'stream: 'a>
+{
+    tree: Vec<Option<TreeNode<'a>>>, // Internal nodes store losers
+    winner: Option<TreeNode<'a>>,     // Current minimum element
+    iterators: HashMap<usize, TextIterator<'stream, 'a>>,                // Input sequences
+    path_idxs: Vec<Vec<usize>>,
+    k: usize,                         // Number of input sequences
+}
+
+impl<'a, 'stream: 'a> LoserTree<'a, 'stream>
+{
+    /// Create a new loser tree from k iterators
+    pub fn new(mut iterators: HashMap<usize, TextIterator<'stream, 'a>>) -> Self {
+        let k = iterators.len();
+
+        // Tree needs k-1 internal nodes for k leaves
+        let tree_size = LoserTree::calculate_tree_size(k);
+        let mut tree = vec![None; tree_size];
+        
+        // Initialize leaves with first element from each iterator
+	    let mut leaves: Vec<Option<TreeNode<'a>>> = (0..k)
+	        .map(|source| {
+	            if let Some(iter) = iterators.get_mut(&source) {
+	                if let Some(node) = iter.next() {
+	                    Some(node.unwrap())
+	                } else {
+	                    None
+	                }
+	            } else {
+	                None
+	            }
+	        })
+	        .collect();
+
+        let path_idxs: Vec<Vec<usize>> = (0..k).map(|i| LoserTree::get_path_indices(i, k)).collect();
+
+
+        // Build the initial tree
+        let winner = Self::build_tree(&mut tree, &mut leaves);
+
+
+
+        LoserTree {
+            tree,
+            winner,
+            iterators,
+            path_idxs,
+            k,
+        }
+    }
+
+	fn build_tree(
+	    tree: &mut [Option<TreeNode<'a>>],
+	    leaves: &mut [Option<TreeNode<'a>>],
+	) -> Option<TreeNode<'a>> {
+	    let mut level = leaves.to_vec();
+	    let mut level_start = 0;
+	    
+	    while level.len() > 1 {
+	        let mut next_level = Vec::new();
+	        let pairs_in_level = (level.len() + 1) / 2;
+	        
+	        for pair_idx in 0..pairs_in_level {
+	            let left_idx = pair_idx * 2;
+	            let right_idx = left_idx + 1;
+	            
+	            if right_idx < level.len() {
+	                // Compare two elements
+	                match (&level[left_idx], &level[right_idx]) {
+	                    (Some(a), Some(b)) => {
+	                        if a <= b {
+	                            tree[level_start + pair_idx] = Some(b.clone());
+	                            next_level.push(Some(a.clone()));
+	                        } else {
+	                            tree[level_start + pair_idx] = Some(a.clone());
+	                            next_level.push(Some(b.clone()));
+	                        }
+	                    }
+	                    (Some(a), None) => {
+	                        next_level.push(Some(a.clone()));
+	                    }
+	                    (None, Some(b)) => {
+	                        next_level.push(Some(b.clone()));
+	                    }
+	                    (None, None) => {
+	                        next_level.push(None);
+	                    }
+	                }
+	            } else {
+	                // Odd one out
+	                next_level.push(level[left_idx].clone());
+	            }
+	        }
+	        
+	        level_start += pairs_in_level;
+	        level = next_level;
+	    }
+	    
+	    level.into_iter().next().flatten()
+	}
+    /// Get the current minimum element (if any)
+    pub fn peek(&self) -> Option<&TreeNode<'a>> {
+    	self.winner.as_ref()    
+    }
+
+	/// Extract the minimum element and advance the tree
+	pub fn pop(&mut self) -> Result<Option<TreeNode<'a>>, Error> {
+	    let winner = self.winner.take().unwrap();
+	    let source = winner.source;
+	    
+	    let new_tree_entry = if let Some(node) = self.iterators.get_mut(&source).unwrap().next() {
+	        Some(node.unwrap())
+	    } else {
+	        None
+	    };
+	    
+	    self.winner = self.replay(new_tree_entry, source);
+	    Ok(Some(winner))
+	}
+
+	pub fn pop_verbose(&mut self) -> Result<Option<TreeNode<'a>>, Error> {
+	    let winner = self.winner.take().unwrap();
+	    let source = winner.source;
+	    
+	    let new_tree_entry = if let Some(node) = self.iterators.get_mut(&source).unwrap().next() {
+	        Some(node.unwrap())
+	    } else {
+	        None
+	    };
+	    
+	    println!("Replaying: source={}, new_entry={:?}", source, new_tree_entry.as_ref().map(|n| n.source));
+	    println!("Tree before replay: {:?}", self.tree.iter().map(|n| n.as_ref().map(|x| x.source)).collect::<Vec<_>>());
+	    
+	    self.winner = self.replay(new_tree_entry, source);
+	    
+	    println!("Winner after replay: {:?}", self.winner.as_ref().map(|n| n.source));
+	    println!("Tree after replay: {:?}", self.tree.iter().map(|n| n.as_ref().map(|x| x.source)).collect::<Vec<_>>());
+	    println!("---");
+	    
+	    Ok(Some(winner))
+	}	
+
+
+    pub fn is_empty(&self) -> bool {
+        // Winner must be None AND all tree nodes must be None
+        self.winner.is_none() && self.tree.iter().all(|node| node.is_none())
+    }
+
+    /// Replay comparisons along the path for a new element
+    fn replay_og(&mut self, mut current: Option<TreeNode<'a>>, source: usize) -> Option<TreeNode<'a>> {
+        // Find path from leaf to root based on source index
+        let path = &self.path_idxs[source];
+        for &idx in path {
+            if let Some(ref mut loser) = self.tree[idx] {
+                match &current {
+                    Some(curr) if curr <= loser => {
+                        // Current wins, swap with loser
+                        std::mem::swap(&mut self.tree[idx], &mut current);
+                    }
+                    None => {
+                        // Current is None, loser becomes winner
+                        current = self.tree[idx].take();
+                    }
+                    _ => {
+                        // Loser stays loser, current continues
+                    }
+                }
+            } else if current.is_some() {
+                // No loser at this node yet (shouldn't happen in normal operation)
+                continue;
+            }
+        }
+
+        current
+    }
+
+	fn replay2(&mut self, mut current: Option<TreeNode<'a>>, source: usize) -> Option<TreeNode<'a>> {
+	    let path = &self.path_idxs[source];
+	    for &idx in path {
+	        match (current.as_ref(), self.tree[idx].as_ref()) {
+	            (Some(curr), Some(loser)) => {
+	                if curr <= loser {
+	                    // Current wins
+	                    std::mem::swap(&mut self.tree[idx], &mut current);
+	                }
+	                // else: loser stays loser, current continues
+	            }
+	            (None, Some(_)) => {
+	                // None loses to Some
+	                current = self.tree[idx].take();
+	            }
+	            (Some(_), None) => {
+	                // Some wins against None, store None as loser
+	                std::mem::swap(&mut self.tree[idx], &mut current);
+	            }
+	            (None, None) => {
+	                // Both None, continue
+	            }
+	        }
+	    }
+	    current
+	}    
+
+
+	fn replay(&mut self, mut current: Option<TreeNode<'a>>, source: usize) -> Option<TreeNode<'a>> {
+	    let path = &self.path_idxs[source];
+	    for &idx in path {
+	        match (&current, &self.tree[idx]) {
+	            (Some(curr), Some(loser)) if curr <= loser => {
+	                // Current wins, swap with loser
+	                std::mem::swap(&mut self.tree[idx], &mut current);
+	            }
+	            (None, Some(_)) => {
+	                // None always loses to Some
+	                current = self.tree[idx].take();
+	            }
+	            (Some(_), None) => {
+	                // Some always wins against None, store None as loser
+	                self.tree[idx] = current.take();
+	                // Wait, we need current back!
+	                current = self.tree[idx].take();
+	                self.tree[idx] = None;
+	            }
+	            _ => {
+	                // Some(curr) > Some(loser) => loser stays, current continues
+	                // Both None => current continues
+	            }
+	        }
+	    }
+	    current
+	}
+
+
+    /// Get the indices along the path from leaf to root
+    fn get_path_indices(leaf: usize, k: usize) -> Vec<usize> {
+        let mut path = Vec::new();
+        let mut pos = leaf;
+        let mut level_size = k;
+        let mut level_start = 0;
+
+        while level_size > 1 {
+            let pair_idx = pos / 2;
+            path.push(level_start + pair_idx);
+            
+            level_start += (level_size + 1) / 2;
+            pos = pair_idx;
+            level_size = (level_size + 1) / 2;
+        }
+
+        path
+    }
+
+    fn calculate_tree_size(k: usize) -> usize {
+	    let mut total = 0;
+	    let mut level_size = k;
+	    
+	    while level_size > 1 {
+	        total += (level_size + 1) / 2;
+	        level_size = (level_size + 1) / 2;
+	    }
+	    
+	    total    	
+    }
+}
+
+
+
+
