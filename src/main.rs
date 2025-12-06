@@ -100,8 +100,8 @@ use crate::minhash_disk::{
     mh_build_file_map, mh_build_uf, mh_clean_files, mh_gather_edges, mh_hash_docs,
 };
 use crate::minhash_memory::minhash_memory;
+use crate::sa_base::{get_matches_serial, make_sa_tables_cmd, merge_matches, sa_annotate_files, get_matches_parallel};
 use crate::true_jaccard::true_jaccard;
-use crate::sa_base::{make_sa_tables_cmd, pq_serial, merge_matches, sa_annotate_files};
 
 pub mod exact_dedup_disk;
 pub mod exact_dedup_memory;
@@ -109,11 +109,11 @@ pub mod minhash_base;
 pub mod minhash_config;
 pub mod minhash_disk;
 pub mod minhash_memory;
+pub mod sa_base;
 pub mod storage;
 pub mod true_jaccard;
 pub mod uf_rush2;
 pub mod utils;
-pub mod sa_base;
 // pub mod bitpack_vec;
 pub mod table_old;
 // pub mod table_new;
@@ -700,14 +700,14 @@ enum Commands {
     },
     #[clap(arg_required_else_help = true)]
     SaMakeTables {
-        #[arg(required=true, long)]
+        #[arg(required = true, long)]
         input_dir: PathBuf,
 
-        #[arg(required=true, long)]
-        output_dir: PathBuf,        
+        #[arg(required = true, long)]
+        output_dir: PathBuf,
 
         #[arg(long)]
-        config: Option<PathBuf>,         
+        config: Option<PathBuf>,
 
         #[arg(long)]
         file_map: Option<PathBuf>,
@@ -723,50 +723,58 @@ enum Commands {
     },
 
     #[clap(arg_required_else_help = true)]
-    SaPqSerial {
-        #[arg(required=true, long)]
-        storage_dir: PathBuf,    
+    SaGetMatchesSerial {
+        #[arg(required = true, long)]
+        storage_dir: PathBuf,
 
-        #[arg(long, default_value_t=500)]
-        match_length: usize
+        #[arg(long, default_value_t = 500)]
+        match_length: usize,
     },
 
     #[clap(arg_required_else_help = true)]
-    SaMergeMatches {
-        #[arg(required=true, long)]
-        storage_dir: PathBuf,      
+    SaGetMatchesParallel {
+        #[arg(required = true, long)]
+        storage_dir: PathBuf,
 
-        #[arg(long, default_value_t=500)]
-        match_length: usize
+        #[arg(long, default_value_t = 500)]
+        match_length: usize,
+    },    
+
+    #[clap(arg_required_else_help = true)]
+    SaMergeMatches {
+        #[arg(required = true, long)]
+        storage_dir: PathBuf,
+
+        #[arg(long, default_value_t = 500)]
+        match_length: usize,
     },
 
     #[clap(arg_required_else_help = true)]
     SaAnnotate {
-        #[arg(required=true, long)]
-        input_dir: PathBuf,   
+        #[arg(required = true, long)]
+        input_dir: PathBuf,
 
-        #[arg(required=true, long)]
-        storage_dir: PathBuf,   
+        #[arg(required = true, long)]
+        storage_dir: PathBuf,
 
-        #[arg(required=true, long)]
-        output_dir: PathBuf,   
+        #[arg(required = true, long)]
+        output_dir: PathBuf,
 
-        #[arg(required=true, long)]
-        annotate_key: String,                                   
+        #[arg(required = true, long)]
+        annotate_key: String,
     },
 
-    #[clap(arg_required_else_help=true)]
+    #[clap(arg_required_else_help = true)]
     SaAlt {
-        #[arg(required=true, long)]
+        #[arg(required = true, long)]
         text: PathBuf,
 
-        #[arg(required=true, long)]
+        #[arg(required = true, long)]
         sa_table: PathBuf,
 
-        #[arg(long, default_value_t=500)]
-        match_length: usize
-    }
-
+        #[arg(long, default_value_t = 500)]
+        match_length: usize,
+    },
 }
 
 /*=================================================================
@@ -977,27 +985,46 @@ fn main() {
             file_map,
             tokenizer,
             max_lines_per_path,
-            text_key
-        } => make_sa_tables_cmd(input_dir, output_dir, config.clone(), file_map.clone(), tokenizer.clone(), max_lines_per_path.clone(), text_key.clone()),
+            text_key,
+        } => make_sa_tables_cmd(
+            input_dir,
+            output_dir,
+            config.clone(),
+            file_map.clone(),
+            tokenizer.clone(),
+            max_lines_per_path.clone(),
+            text_key.clone(),
+        ),
 
-        Commands::SaPqSerial {
-            storage_dir, match_length 
-        } => pq_serial(storage_dir, *match_length),
+        Commands::SaGetMatchesSerial {
+            storage_dir,
+            match_length,
+        } => get_matches_serial(storage_dir, *match_length),
+
+        Commands::SaGetMatchesParallel {
+            storage_dir,
+            match_length,
+        } => get_matches_parallel(storage_dir, *match_length),        
 
         Commands::SaMergeMatches {
-            storage_dir, match_length
+            storage_dir,
+            match_length,
         } => merge_matches(storage_dir, *match_length),
 
         Commands::SaAnnotate {
-            input_dir, storage_dir, output_dir, annotate_key
+            input_dir,
+            storage_dir,
+            output_dir,
+            annotate_key,
         } => sa_annotate_files(input_dir, storage_dir, output_dir, annotate_key),
 
         Commands::SaAlt {
-            text, sa_table, match_length
+            text,
+            sa_table,
+            match_length,
         } => alternative_merge(text, sa_table, *match_length),
-        
+
         _ => Ok(()),
     };
     result.unwrap()
-
 }
