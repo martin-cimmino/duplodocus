@@ -222,10 +222,18 @@ impl<'stream, 'a, R: Read + ByteSize> Iterator for TextIterator<'stream, 'a, R> 
                 }
                 let slice = &self.stream.text[next_idx as usize..next_idx as usize + self.min_len];
                 //let sv : SmallVec<[u8; 512]> = SmallVec::from_slice(&slice);
+                let prev_char: Option<u8> = if next_idx > 0 {
+                	let prev_char = (&self.stream.text.get(next_idx as usize - 1)).clone();
+                	prev_char.copied()
+                } else {
+                	None
+                };               
+
                 return Some(Ok(TreeNode {
                     sa_value: next_idx,
                     cmp_bytes: slice,
                     source: self.stream.source,
+                    prev_char: prev_char
                 }));
             } else {
                 return None;
@@ -310,6 +318,15 @@ pub struct TreeNode<'a> {
     pub sa_value: u64,       // value 1 that the object holds
     pub cmp_bytes: &'a [u8], // value 2 that the object holds
     pub source: usize,       // which input stream this came from
+    pub prev_char: Option<u8>     // the byte that occurs BEFORE this one in the stream (if it exists)
+}
+impl TreeNode<'_> {
+	pub fn prev_char_same(&self, other: &TreeNode)  -> bool {
+		match (&self.prev_char, other.prev_char) {
+			(None, None) => false,
+			(a, b) => *a == b
+		}		
+	}
 }
 
 impl Ord for TreeNode<'_> {

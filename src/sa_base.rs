@@ -41,7 +41,6 @@ Scaling notes:
 - do NOT assume that all text + SA's can fit into main memory
 
 
-
 Notes for mega-scale suffix-array usage:
 
 Step 1: Make suffix array tables.
@@ -71,6 +70,20 @@ Where:
 		each thread can have THREAD_MEM := SYS_MEM / THREAD_COUNT memory
 		so that means each thread can have THREAD_MEM/9 * SAFETY_MARGIN text max
 3) save everything
+
+
+Step 2: 
+Output: 
+	- storage/matches/match_part_XXXX.bin
+	  where the contents are 
+	  <source><sa_value>
+	  where each is a u64, and means that a repeat starts at text_part_<source>.bin[sa_value]
+
+
+Step 3: just needs to load matches and offsets into main memory 
+
+Step 4: standard annotation flow, shouldn't overrun memory
+
 */
 
 
@@ -377,16 +390,21 @@ pub fn pq_serial(storage_dir: &PathBuf, match_length: usize) -> Result<(), Error
         if cur_min.source == prev_min.source {
             stream_runs += 1;
         }
+
         if cur_min == prev_min {
             if !currently_in_a_run {
-                match_writer
-                    .write(prev_min.source, &prev_min.sa_value.to_le_bytes())
-                    .unwrap();
+            	if !cur_min.prev_char_same(&prev_min) {
+	                match_writer
+    	                .write(prev_min.source, &prev_min.sa_value.to_le_bytes())
+	                    .unwrap();
+	            }
                 match_count.fetch_add(1, Ordering::SeqCst);
             }
-            match_writer
-                .write(cur_min.source, &cur_min.sa_value.to_le_bytes())
-                .unwrap();
+            if !cur_min.prev_char_same(&prev_min) {
+	            match_writer
+	                .write(cur_min.source, &cur_min.sa_value.to_le_bytes())
+	                .unwrap();
+	        }
             match_count.fetch_add(1, Ordering::SeqCst);
             currently_in_a_run = true;
         } else {
