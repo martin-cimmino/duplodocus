@@ -223,8 +223,8 @@ impl<'stream, 'a, R: Read + ByteSize> Iterator for TextIterator<'stream, 'a, R> 
                 let slice = &self.stream.text[next_idx as usize..next_idx as usize + self.min_len];
                 //let sv : SmallVec<[u8; 512]> = SmallVec::from_slice(&slice);
                 let prev_char: Option<u8> = if next_idx > 0 {
-                	let prev_char = (&self.stream.text.get(next_idx as usize - 1)).clone();
-                	prev_char.copied()
+                	let prev_char = (&self.stream.text.get(next_idx as usize - 1)).clone().unwrap();
+                	Some(*prev_char)
                 } else {
                 	None
                 };               
