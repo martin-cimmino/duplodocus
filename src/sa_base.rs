@@ -1,3 +1,6 @@
+use rand::SeedableRng;
+use rand::Rng;
+use rand_chacha::ChaCha8Rng;
 use crate::minhash_base::FileMap;
 use crate::utils::json_set;
 use ahash::HashMap;
@@ -6,116 +9,76 @@ use glob::glob;
 use serde_json::json;
 use serde_json::Value;
 use std::cmp::Reverse;
-use std::fs::create_dir_all;
 use std::fs::File;
-use std::fs::OpenOptions;
 use std::io::BufRead;
-use std::io::BufReader;
-use std::io::BufWriter;
 use std::io::Read;
 use std::io::Seek;
 use std::io::SeekFrom;
-use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
-use std::sync::Mutex;
 use std::time::Instant;
 
 use crate::table_old::SuffixTable;
-use anyhow::{Context, Error, Result};
+use anyhow::{Error, Result};
 use gjson;
 use mj_io::{
     build_pbar, get_output_filename, read_pathbuf, read_pathbuf_to_mem, write_mem_to_pathbuf,
 };
 use rayon;
 use rayon::prelude::*;
-use serde::{Deserialize, Serialize};
-use std::fs;
 use std::path::PathBuf;
 
 use std::cmp::Ordering as StdOrdering;
 use std::collections::BinaryHeap;
 
+use crate::sa_utils::{FileRange, SAStream, TextIterator, MatchWriter, TreeNode, LoserTree, read_u64_vec, sa_safety_check, sa_thread_memory};
+use crate::sa_config::{SAConfigOverrides, SAConfig};
 
-/*====================================================
-=                    CONFIGURATIONS                  =
-====================================================*/
+/*
 
-const DEFAULT_MAX_LINES_PER_PATH: usize = 1_000_000_000;
-const DEFAULT_TOKENIZER: &str = "bytes"; //.to_string();
-const DEFAULT_TEXT_KEY: &str = "text";
-const DEFAULT_RANDOM_SEED: usize = 42;
+Scaling notes:
+- assume that all text can fit into main memory
+- do NOT assume that all text + SA's can fit into main memory
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SAConfig {
-    pub tokenizer: String,
-    /// Defaults to using bytes
-    pub max_lines_per_path: usize,
-    /// Defaults to 1_000_000_000
-    pub text_key: String,
-    pub random_seed: usize,
-}
 
-impl Default for SAConfig {
-    fn default() -> Self {
-        Self {
-            tokenizer: DEFAULT_TOKENIZER.to_string(),
-            max_lines_per_path: DEFAULT_MAX_LINES_PER_PATH,
-            text_key: DEFAULT_TEXT_KEY.to_string(),
-            random_seed: DEFAULT_RANDOM_SEED,
-        }
-    }
-}
 
-pub struct SAConfigOverrides {
-    pub tokenizer: Option<String>,
-    pub max_lines_per_path: Option<usize>,
-    pub text_key: Option<String>,
-    pub random_seed: Option<usize>,
-}
+Notes for mega-scale suffix-array usage:
 
-impl SAConfigOverrides {
-    fn apply_to(self, config: &mut SAConfig) {
-        if let Some(val) = self.tokenizer {
-            config.tokenizer = String::from(val.clone());
-        }
+Step 1: Make suffix array tables.
+Output:
+	- storage/file_map.json.gz	
+	k separate files:
+	- storage/text/text_part_XXXX.bin
+	- storage/table/table_part_XXXX.bin
+	- storage/offsets/offset_part_XXXX.bin
 
-        if let Some(val) = self.max_lines_per_path {
-            config.max_lines_per_path = val;
-        }
+Where: 
+	- text is a global concatenation of:
+		<document_text>\xff\xff<path_id><line_num>
+		where path_id and line_num are both little-ended u64's
 
-        if let Some(val) = self.text_key {
-            config.text_key = String::from(val);
-        }
+	- table is the suffix table for the given text 
+	- offsets is 
+		<path_id><line_num><doc_len>
+		where each are little-ended u64s
 
-        if let Some(val) = self.random_seed {
-            config.random_seed = val;
-        }
-    }
-}
+- So we:
+1) load all text
+2) from here, compute the SA sizes
+	a) can do the 'large-as-possible', where we have 1 suffix array, but this is non-threaded
+	b) can do the 'one SA per thread', where number of SA's are small (pay logK later)
+	c) make chunks based on RAM sizes:
+		each thread can have THREAD_MEM := SYS_MEM / THREAD_COUNT memory
+		so that means each thread can have THREAD_MEM/9 * SAFETY_MARGIN text max
+3) save everything
+*/
 
-impl SAConfig {
-    pub fn load_with_overrides(
-        config_path: Option<PathBuf>,
-        overrides: SAConfigOverrides,
-    ) -> Result<Self, Error> {
-        let mut config = Self::default();
-        if let Some(path) = config_path {
-            let config_content = fs::read_to_string(path)?;
-            let file_config: SAConfig = serde_yaml::from_str(&config_content)?;
-            config = file_config;
-        }
-
-        overrides.apply_to(&mut config);
-        Ok(config)
-    }
-}
 
 /*======================================================
 =                    MAKE TABLE                        =
 ======================================================*/
+const MEMORY_SAFETY_MARGIN: f64 = 0.90;
+
 
 pub fn make_sa_tables_cmd(
     input_dir: &PathBuf,
@@ -166,47 +129,28 @@ pub fn make_sa_tables(
     // Step 1: load all data into memory and then maybe tokenize if needed?
     let start_read = Instant::now();
     println!("Reading all documents texts...");
-    let mut data_docs = load_data_docs(file_map, config_obj, input_dir).unwrap();
+    let data_docs = load_data_docs(file_map, config_obj, input_dir).unwrap();
     println!(" {:?} DOCS TOTAL", data_docs.len());
-    println!(
-        "TOTAL IDX {:?}",
-        data_docs.iter().map(|tup| tup.0).sum::<usize>()
-    );
     println!(
         "...Read all documents in {:?} secs",
         start_read.elapsed().as_secs()
     );
 
+    // Safety check:
+    let corpus_len: usize = data_docs.par_iter().map(|(_, _, doc)| doc.len() + 2 * 8).sum();
+    assert!(sa_safety_check(corpus_len));
+    let thread_count = rayon::current_num_threads();
+    let thread_mem = sa_thread_memory(thread_count, MEMORY_SAFETY_MARGIN);
+
+
+
     // Step 2 (optional): Tokenize if needed
     // TODO: tokenizer thing
 
+
     // Step 3: Break into chunks and make SA table for each of them
-    let thread_count = rayon::current_num_threads();
-    let chunk_size = (data_docs.len() - 1) / thread_count + 1;
-    let owned_chunks: DashMap<usize, Vec<(usize, usize, String)>> = DashMap::new();
-    let mut chunk_idx = 0;
-    while data_docs.len() >= chunk_size {
-        let chunk = data_docs.split_off(data_docs.len() - chunk_size);
-        println!("LENCHUNK {:?}", chunk.len());
-        owned_chunks.insert(chunk_idx, chunk);
-        chunk_idx += 1;
-    }
-    println!("DD {:?} | {:?}", data_docs.len(), chunk_size);
+    let owned_chunks: DashMap<usize, Vec<(usize, usize, String)>> = chunk_data_for_sa(config_obj, data_docs, thread_mem, thread_count);
     let total_bytes = AtomicUsize::new(0);
-    let mut global_offsets: Vec<u64> = Vec::new();
-    global_offsets.push(0 as u64);
-    for i in 0..(owned_chunks.len() - 1) {
-        let allocate_size = owned_chunks
-            .get(&i)
-            .unwrap()
-            .par_iter()
-            .map(|(_, _, s)| s.len() + 2 + 2 * 8)
-            .sum::<usize>();
-        global_offsets.push(global_offsets.last().unwrap() + allocate_size as u64);
-    }
-    let global_offset_filename = output_dir.clone().join("offsets").join("global_offset.bin");
-    let global_offset_bytes: &[u8] = bytemuck::cast_slice(&global_offsets);
-    write_mem_to_pathbuf(global_offset_bytes, &global_offset_filename).unwrap();
 
     let total_pbar = build_pbar(owned_chunks.len() * 4, "Total steps");
     owned_chunks.into_par_iter().for_each(|(table_idx, chunk)| {
@@ -273,11 +217,12 @@ pub fn load_data_docs(
     local_input: &PathBuf,
 ) -> Result<Vec<(usize, usize, String)>, Error> {
     let text_key = config.text_key.clone();
-    let extant_idxs: Vec<(&PathBuf, &usize)> = file_map
+    let mut extant_idxs: Vec<(&PathBuf, &usize)> = file_map
         .indices
         .par_iter()
         .filter(|(p, _idx)| local_input.clone().join(p).exists())
         .collect();
+    extant_idxs.par_sort_unstable_by_key(|(_, &i)| i);
 
     let pbar = build_pbar(extant_idxs.len(), "Paths");
     let data_docs: Vec<(usize, usize, String)> = extant_idxs
@@ -310,6 +255,70 @@ fn get_part_num(path: &PathBuf) -> Result<usize, Error> {
         .unwrap())
 }
 
+fn chunk_data_for_sa(
+    config: &SAConfig, 
+    data_docs: Vec<(usize, usize, String)>, 
+    thread_memory: usize, 
+    thread_count: usize
+) -> DashMap<usize, Vec<(usize, usize, String)>> {
+    let owned_chunks: DashMap<usize, Vec<(usize, usize, String)>> = DashMap::new();
+    let chunk_limit = thread_memory / 9;
+
+    // Step 1: shuffle and index the data
+    let mut indexed: Vec<(u64, (usize, usize, String))> = data_docs
+        .into_par_iter()
+        .enumerate()
+        .map(|(i, item)| {
+            let mut rng = ChaCha8Rng::seed_from_u64(config.random_seed.wrapping_add(i as u64));
+            (rng.gen(), item)
+        })
+        .collect();
+    
+    indexed.par_sort_unstable_by_key(|(key, _)| *key);
+
+    // Step 2: distribute into thread buckets by MOVING (no clone!)
+    let mut chunks: Vec<Vec<_>> = (0..thread_count).map(|_| Vec::new()).collect();
+    
+    for (i, item) in indexed.into_iter().enumerate() {
+        chunks[i % thread_count].push(item);
+    }
+    
+    // Sort each bucket in parallel
+    chunks.par_iter_mut().for_each(|bucket| {
+        bucket.par_sort_unstable_by_key(|(r, _)| *r);
+    });
+
+    // Step 3: split each bucket into memory-bounded chunks
+    chunks.into_par_iter().enumerate().for_each(|(chunk_id, chunk)| {
+        let mut current_part = chunk_id;
+        let mut current_size = 0;
+        let mut current_chunk = Vec::new();
+
+        for (_, (idx1, idx2, text)) in chunk {
+            let item_size = text.len() + 16; // approximate overhead
+            assert!(item_size < chunk_limit, "Document too large for chunk limit!");
+            
+            if current_size + item_size > chunk_limit && current_size > 0 {
+                // Flush current chunk
+                owned_chunks.insert(current_part, current_chunk);
+                current_chunk = Vec::new();
+                current_size = 0;
+                current_part += thread_count;
+            }
+            
+            current_chunk.push((idx1, idx2, text));
+            current_size += item_size;
+        }
+        
+        // Don't forget the last chunk
+        if !current_chunk.is_empty() {
+            owned_chunks.insert(current_part, current_chunk);
+        }
+    });
+
+    owned_chunks
+}
+
 /*============================================================
 =                            PQ LOOPS                        =
 ============================================================*/
@@ -337,7 +346,7 @@ pub fn pq_serial(storage_dir: &PathBuf, match_length: usize) -> Result<(), Error
     	*/
 
     let mut pq: BinaryHeap<Reverse<TreeNode>> = BinaryHeap::new();
-    for (source, iterator) in stream_iterators.iter_mut() {
+    for (_source, iterator) in stream_iterators.iter_mut() {
         if let Some(node) = iterator.next() {
             let node = node.unwrap();
             pq.push(Reverse(node));
@@ -543,7 +552,6 @@ pub fn get_matches_parallel(storage_dir: &PathBuf, match_length: usize) -> Resul
     // Get a #threads-1 list of internal boundaries to make #threads streams for each part
     let reference_suffices =
         get_reference_suffices(storage_dir, match_length, thread_count, &text_lookup).unwrap();
-    println!("BOUNDARIES ARE {:?}", reference_suffices);
     // Get a #Parts x #threads streams
     let substreams =
         get_all_substreams(storage_dir, reference_suffices, match_length, &text_lookup).unwrap();
@@ -1111,523 +1119,3 @@ fn sa_annotate_path(
     Ok((p_anno_docs, p_anno_bytes))
 }
 
-/*======================================================================
-=                            FILE STREAM STUFF                         =
-======================================================================*/
-
-pub struct FileRange {
-    file: File,
-    start: u64,
-    end: u64,
-    current: u64,
-}
-impl FileRange {
-    pub fn new(mut file: File, start: u64, end: u64) -> Result<Self, Error> {
-        // Seek to the start position
-        file.seek(SeekFrom::Start(start)).unwrap();
-
-        Ok(FileRange {
-            file,
-            start,
-            end,
-            current: start,
-        })
-    }
-}
-
-impl Read for FileRange {
-    fn read(&mut self, buf: &mut [u8]) -> Result<usize, std::io::Error> {
-        // Calculate how many bytes we can still read
-        let remaining = self.end.saturating_sub(self.current);
-
-        if remaining == 0 {
-            return Ok(0); // EOF
-        }
-
-        // Limit the read to not exceed our range
-        let to_read = std::cmp::min(buf.len() as u64, remaining) as usize;
-        let n = self.file.read(&mut buf[..to_read]).unwrap();
-
-        self.current += n as u64;
-        Ok(n)
-    }
-}
-
-struct SAStream<'a, R: Read> {
-    reader: BufReader<R>,
-    text: &'a [u8],
-    buffer: Vec<u64>,
-    position: usize,
-    chunk_size: usize,
-    source: usize,
-}
-
-impl<'a, R: Read> SAStream<'a, R> {
-    fn new(sa_file: R, text: &'a [u8], source: usize, chunk_size: usize) -> Result<Self, Error> {
-        Ok(Self {
-            reader: BufReader::new(sa_file),
-            text: text,
-            buffer: Vec::with_capacity(chunk_size),
-            position: 0,
-            chunk_size,
-            source,
-        })
-    }
-
-    fn refill_buffer(&mut self) -> Result<bool> {
-        self.buffer.clear();
-        self.position = 0;
-
-        let bytes_to_read = self.chunk_size * 8;
-        let mut byte_buffer = vec![0u8; bytes_to_read];
-
-        let mut total_read = 0;
-        while total_read < bytes_to_read {
-            match self.reader.read(&mut byte_buffer[total_read..]) {
-                Ok(0) => break, // EOF
-                Ok(n) => total_read += n,
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(e).context("Failed to read from file"),
-            }
-        }
-
-        // Convert bytes to u64s
-        for chunk in byte_buffer[..total_read].chunks_exact(8) {
-            let bytes: [u8; 8] = chunk.try_into().unwrap();
-            self.buffer.push(u64::from_le_bytes(bytes));
-        }
-
-        Ok(!self.buffer.is_empty())
-    }
-
-    fn text_iter<'stream>(&'stream mut self, min_len: usize) -> TextIterator<'stream, 'a, R> {
-        TextIterator {
-            stream: self,
-            min_len,
-        }
-    }
-}
-
-impl<'a, R: Read> Iterator for SAStream<'a, R> {
-    type Item = Result<u64, Error>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.position >= self.buffer.len() {
-            match self.refill_buffer() {
-                Ok(true) => {}
-                Ok(false) => return None, // EOF
-                Err(e) => return Some(Err(e)),
-            }
-        }
-
-        if self.position < self.buffer.len() {
-            let value = self.buffer[self.position];
-            self.position += 1;
-            Some(Ok(value))
-        } else {
-            None
-        }
-    }
-}
-
-pub struct TextIterator<'stream, 'a, R: Read> {
-    stream: &'stream mut SAStream<'a, R>,
-    min_len: usize,
-}
-
-impl<'stream, 'a, R: Read> Iterator for TextIterator<'stream, 'a, R> {
-    type Item = Result<TreeNode<'a>, Error>;
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            let next_idx_opt = self.stream.next();
-            if let Some(next_idx) = next_idx_opt {
-                let next_idx = next_idx.unwrap();
-                if next_idx as usize + self.min_len >= self.stream.text.len() {
-                    continue;
-                }
-                let slice = &self.stream.text[next_idx as usize..next_idx as usize + self.min_len];
-                //let sv : SmallVec<[u8; 512]> = SmallVec::from_slice(&slice);
-                return Some(Ok(TreeNode {
-                    sa_value: next_idx,
-                    cmp_bytes: slice,
-                    source: self.stream.source,
-                }));
-            } else {
-                return None;
-            }
-        }
-        None
-    }
-}
-
-/*====================================================================
-=                           MATCH WRITER THING                       =
-====================================================================*/
-
-pub struct MatchWriter {
-    pub writer: DashMap<usize, Arc<Mutex<BufWriter<File>>>>,
-    pub storage_loc: PathBuf,
-}
-
-impl MatchWriter {
-    pub fn new(storage_loc: &PathBuf) -> Result<Self, Error> {
-        let writer: DashMap<usize, Arc<Mutex<BufWriter<File>>>> = DashMap::new();
-        let storage_loc = storage_loc.clone();
-        if !storage_loc.exists() {
-            create_dir_all(&storage_loc).unwrap();
-        }
-
-        Ok(MatchWriter {
-            writer,
-            storage_loc,
-        })
-    }
-
-    pub fn make_new_writer(&self, idx: usize) -> Result<Arc<Mutex<BufWriter<File>>>, Error> {
-        let filename = &self.get_filename(idx);
-        let file = OpenOptions::new()
-            .append(true)
-            .create(true)
-            .mode(0o644)
-            .open(filename)
-            .unwrap();
-        let buf_writer = BufWriter::new(file);
-        let output = Arc::new(Mutex::new(buf_writer));
-        Ok(output)
-    }
-
-    pub fn write(&self, idx: usize, bytes: &[u8]) -> Result<(), Error> {
-        let buf_writer_arc = if let Some(buf_writer_arc) = self.writer.get(&idx) {
-            buf_writer_arc
-        } else {
-            let buf_writer_arc = self.make_new_writer(idx).unwrap();
-            self.writer.insert(idx, buf_writer_arc);
-            self.writer.get(&idx).unwrap()
-        };
-
-        buf_writer_arc.lock().unwrap().write(bytes).unwrap();
-        Ok(())
-    }
-
-    pub fn finish(&self) -> Result<(), Error> {
-        self.writer
-            .par_iter()
-            .for_each(|e| e.lock().unwrap().flush().unwrap());
-        Ok(())
-    }
-
-    pub fn get_filename(&self, idx: usize) -> PathBuf {
-        self.storage_loc
-            .clone()
-            .join(format!("match_part_{:04}.bin", idx))
-    }
-}
-
-/*======================================================
-=                           UTILS                      =
-======================================================*/
-
-fn read_u64_vec(p: &PathBuf) -> Result<Vec<u64>, Error> {
-    let file_size = std::fs::metadata(&p)?.len() as usize;
-    let mut output: Vec<u64> = vec![0u64; file_size / 8];
-    let bytes_view: &mut [u8] = bytemuck::cast_slice_mut(&mut output);
-    std::fs::File::open(&p)
-        .unwrap()
-        .read_exact(bytes_view)
-        .unwrap();
-    Ok(output)
-}
-
-
-/*========================================================
-=                            LOSER TREE STUFF            =
-========================================================*/
-
-/// Represents an element in the loser tree along with its source sequence index
-#[derive(Debug, Clone)]
-pub struct TreeNode<'a> {
-    sa_value: u64,       // value 1 that the object holds
-    cmp_bytes: &'a [u8], // value 2 that the object holds
-    source: usize,       // which input stream this came from
-}
-
-impl Ord for TreeNode<'_> {
-    fn cmp(&self, other: &Self) -> StdOrdering {
-        self.cmp_bytes.cmp(&other.cmp_bytes)
-    }
-}
-
-impl PartialOrd for TreeNode<'_> {
-    fn partial_cmp(&self, other: &Self) -> Option<StdOrdering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl PartialEq for TreeNode<'_> {
-    fn eq(&self, other: &Self) -> bool {
-        self.cmp_bytes == other.cmp_bytes
-    }
-}
-
-impl Eq for TreeNode<'_> {}
-
-/// Loser Tree for efficient k-way merging
-pub struct LoserTree<'a, 'stream: 'a, R: Read> {
-    tree: Vec<Option<TreeNode<'a>>>, // Internal nodes store losers
-    loser: Option<TreeNode<'a>>,     // Current minimum element
-    shortcut_count: usize,
-
-    iterators: HashMap<usize, TextIterator<'stream, 'a, R>>, // Input sequences
-    path_idxs: Vec<Vec<usize>>,
-}
-
-impl<'a, 'stream: 'a, R: Read> LoserTree<'a, 'stream, R> {
-    /// Create a new loser tree from k iterators
-    pub fn new(mut iterators: HashMap<usize, TextIterator<'stream, 'a, R>>) -> Self {
-        let k = iterators.len();
-
-        // Tree needs k-1 internal nodes for k leaves
-        let tree_size = LoserTree::<R>::calculate_loser_tree_size(k);
-        let mut tree = vec![None; tree_size];
-
-        // Initialize leaves with first element from each iterator
-        let mut leaves: Vec<Option<TreeNode<'a>>> = (0..k)
-            .map(|source| {
-                if let Some(iter) = iterators.get_mut(&source) {
-                    if let Some(node) = iter.next() {
-                        Some(node.unwrap())
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        let path_idxs: Vec<Vec<usize>> = (0..k)
-            .map(|i| LoserTree::<R>::get_path_indices(i, k))
-            .collect();
-
-        // Build the initial tree
-        let loser = Self::build_tree(&mut tree, &mut leaves);
-
-        let shortcut_count = 0;
-
-        LoserTree {
-            tree,
-            loser,
-            iterators,
-            path_idxs,
-            shortcut_count,
-        }
-    }
-
-    fn build_tree(
-        tree: &mut [Option<TreeNode<'a>>],
-        leaves: &mut [Option<TreeNode<'a>>],
-    ) -> Option<TreeNode<'a>> {
-        let mut level = leaves.to_vec();
-        let mut level_start = 0;
-
-        while level.len() > 1 {
-            let mut next_level = Vec::new();
-            let pairs_in_level = (level.len() + 1) / 2;
-
-            for pair_idx in 0..pairs_in_level {
-                let left_idx = pair_idx * 2;
-                let right_idx = left_idx + 1;
-
-                if right_idx < level.len() {
-                    // Compare two elements
-                    match (&level[left_idx], &level[right_idx]) {
-                        (Some(a), Some(b)) => {
-                            if a <= b {
-                                // A loses to B, so B stops here and A advances
-                                tree[level_start + pair_idx] = Some(b.clone());
-                                next_level.push(Some(a.clone()));
-                            } else {
-                                // Other way around
-                                tree[level_start + pair_idx] = Some(a.clone());
-                                next_level.push(Some(b.clone()));
-                            }
-                        }
-                        (Some(a), None) => {
-                            // B is None (ultimate winner), so A advances
-                            next_level.push(Some(a.clone()));
-                        }
-                        (None, Some(b)) => {
-                            // A is None (ultimate winner), so B advances
-                            next_level.push(Some(b.clone()));
-                        }
-                        (None, None) => {
-                            // None must advance
-                            next_level.push(None);
-                        }
-                    }
-                } else {
-                    // Odd one out
-                    next_level.push(level[left_idx].clone());
-                }
-            }
-
-            level_start += pairs_in_level;
-            level = next_level;
-        }
-
-        level.into_iter().next().flatten()
-    }
-    /// Get the current minimum element (if any)
-    pub fn peek(&self) -> Option<&TreeNode<'a>> {
-        self.loser.as_ref()
-    }
-
-    /// Extract the minimum element and advance the tree
-    pub fn pop(&mut self) -> Result<Option<TreeNode<'a>>, Error> {
-        let loser = self.loser.take().unwrap();
-        let source = loser.source;
-
-        let new_tree_entry = if let Some(node) = self.iterators.get_mut(&source).unwrap().next() {
-            Some(node.unwrap())
-        } else {
-            None
-        };
-
-        self.loser = self.replay(new_tree_entry, source);
-        Ok(Some(loser))
-    }
-
-    pub fn pop_check(&mut self) -> Result<Option<TreeNode<'a>>, Error> {
-        let loser = self.loser.take().unwrap();
-        let loser_source = loser.source;
-
-        let new_tree_entry =
-            if let Some(node) = self.iterators.get_mut(&loser_source).unwrap().next() {
-                let new_node = node.unwrap();
-                match self.tree.last() {
-                    Some(None) => {
-                        self.shortcut_count += 1;
-                        self.loser = Some(new_node);
-                        return Ok(Some(loser));
-                    }
-                    Some(Some(second_min)) => {
-                        if new_node < *second_min {
-                            self.shortcut_count += 1;
-                            self.loser = Some(new_node);
-                            return Ok(Some(loser));
-                        } else {
-                            Some(new_node)
-                        }
-                    }
-                    _ => Some(new_node),
-                }
-            } else {
-                None
-            };
-
-        self.loser = self.replay(new_tree_entry, loser_source);
-        Ok(Some(loser))
-    }
-
-    pub fn pop_verbose(&mut self) -> Result<Option<TreeNode<'a>>, Error> {
-        let loser = self.loser.take().unwrap();
-        let source = loser.source;
-
-        let new_tree_entry = if let Some(node) = self.iterators.get_mut(&source).unwrap().next() {
-            Some(node.unwrap())
-        } else {
-            None
-        };
-
-        println!(
-            "Replaying: source={}, new_entry={:?}",
-            source,
-            new_tree_entry.as_ref().map(|n| n.source)
-        );
-        println!(
-            "Tree before replay: {:?}",
-            self.tree
-                .iter()
-                .map(|n| n.as_ref().map(|x| x.source))
-                .collect::<Vec<_>>()
-        );
-
-        self.loser = self.replay(new_tree_entry, source);
-
-        println!(
-            "Winner after replay: {:?}",
-            self.loser.as_ref().map(|n| n.source)
-        );
-        println!(
-            "Tree after replay: {:?}",
-            self.tree
-                .iter()
-                .map(|n| n.as_ref().map(|x| x.source))
-                .collect::<Vec<_>>()
-        );
-        println!("---");
-
-        Ok(Some(loser))
-    }
-
-    pub fn is_empty(&self) -> bool {
-        // Winner must be None AND all tree nodes must be None
-        self.loser.is_none() && self.tree.iter().all(|node| node.is_none())
-    }
-
-    fn replay(&mut self, mut current: Option<TreeNode<'a>>, source: usize) -> Option<TreeNode<'a>> {
-        let path = &self.path_idxs[source];
-        for &idx in path {
-            match (&current, &self.tree[idx]) {
-                // Both exist, need comparison
-                (Some(curr), Some(loser)) => {
-                    if curr > loser {
-                        // Current WINS (is bigger) against stored loser, so we need to swap and advance stored loser
-                        std::mem::swap(&mut self.tree[idx], &mut current);
-                    } else {
-                        // Current LOSES (is smaller), so current loser stays where it is and current continues up
-                    }
-                }
-
-                // Current is None (stream is exhausted), but tree has a value
-                // None can be though of as MAX, so needs swap
-                (None, Some(_)) => {
-                    std::mem::swap(&mut self.tree[idx], &mut current);
-                }
-                // Other two cases are where None is in the tree, so no swap ever needed
-                (_, _) => {}
-            }
-        }
-        current
-    }
-
-    /// Get the indices along the path from leaf to root
-    fn get_path_indices(leaf: usize, k: usize) -> Vec<usize> {
-        let mut path = Vec::new();
-        let mut pos = leaf;
-        let mut level_size = k;
-        let mut level_start = 0;
-
-        while level_size > 1 {
-            let pair_idx = pos / 2;
-            path.push(level_start + pair_idx);
-
-            level_start += (level_size + 1) / 2;
-            pos = pair_idx;
-            level_size = (level_size + 1) / 2;
-        }
-
-        path
-    }
-    fn calculate_loser_tree_size(k: usize) -> usize {
-        let mut total = 0;
-        let mut level_size = k;
-
-        while level_size > 1 {
-            total += (level_size + 1) / 2;
-            level_size = (level_size + 1) / 2;
-        }
-
-        total
-    }
-}

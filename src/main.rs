@@ -116,6 +116,8 @@ pub mod uf_rush2;
 pub mod utils;
 // pub mod bitpack_vec;
 pub mod table_old;
+pub mod sa_utils;
+pub mod sa_config;
 // pub mod table_new;
 /* 4 basic use cases here:
 {Exact, Fuzzy} x {Memory, Disk} deduplication:
