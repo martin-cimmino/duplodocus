@@ -66,6 +66,16 @@ pub fn sa_thread_memory(num_threads: usize, safety_margin: f64) -> usize {
 =                            FILE STREAM STUFF                         =
 ======================================================================*/
 
+pub trait ByteSize {
+	fn byte_size(&self) -> Result<u64, Error>;
+}
+
+impl ByteSize for File {
+	fn byte_size(&self) -> Result<u64, Error> {
+		Ok(self.metadata().unwrap().len())
+	}
+}
+
 #[allow(dead_code)]
 pub struct FileRange {
     file: File,
@@ -105,17 +115,27 @@ impl Read for FileRange {
     }
 }
 
-pub struct SAStream<'a, R: Read> {
+impl ByteSize for FileRange {
+	fn byte_size(&self) -> Result<u64, Error> {
+		Ok(self.end - self.start)
+	}
+}
+
+
+pub struct SAStream<'a, R: Read + ByteSize> {
     pub reader: BufReader<R>,
     pub text: &'a [u8],
     pub buffer: Vec<u64>,
     pub position: usize,
     pub chunk_size: usize,
     pub source: usize,
+    pub byte_size: u64,
 }
 
-impl<'a, R: Read> SAStream<'a, R> {
+impl<'a, R: Read + ByteSize> SAStream<'a, R> {
     pub fn new(sa_file: R, text: &'a [u8], source: usize, chunk_size: usize) -> Result<Self, Error> {
+    	let byte_size = sa_file.byte_size().unwrap();
+
         Ok(Self {
             reader: BufReader::new(sa_file),
             text: text,
@@ -123,6 +143,7 @@ impl<'a, R: Read> SAStream<'a, R> {
             position: 0,
             chunk_size,
             source,
+            byte_size
         })
     }
 
@@ -160,7 +181,7 @@ impl<'a, R: Read> SAStream<'a, R> {
     }
 }
 
-impl<'a, R: Read> Iterator for SAStream<'a, R> {
+impl<'a, R: Read + ByteSize> Iterator for SAStream<'a, R> {
     type Item = Result<u64, Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -182,14 +203,14 @@ impl<'a, R: Read> Iterator for SAStream<'a, R> {
     }
 }
 
-pub struct TextIterator<'stream, 'a, R: Read> {
+pub struct TextIterator<'stream, 'a, R: Read> where R: ByteSize, R: ByteSize {
     stream: &'stream mut SAStream<'a, R>,
     min_len: usize,
 }
 
 
 #[allow(unreachable_code)]
-impl<'stream, 'a, R: Read> Iterator for TextIterator<'stream, 'a, R> {
+impl<'stream, 'a, R: Read + ByteSize> Iterator for TextIterator<'stream, 'a, R> {
     type Item = Result<TreeNode<'a>, Error>;
     fn next(&mut self) -> Option<Self::Item> {
         loop {
@@ -312,7 +333,7 @@ impl PartialEq for TreeNode<'_> {
 impl Eq for TreeNode<'_> {}
 
 /// Loser Tree for efficient k-way merging
-pub struct LoserTree<'a, 'stream: 'a, R: Read> {
+pub struct LoserTree<'a, 'stream: 'a, R: Read + ByteSize> {
     tree: Vec<Option<TreeNode<'a>>>, // Internal nodes store losers
     loser: Option<TreeNode<'a>>,     // Current minimum element
     pub shortcut_count: usize,
@@ -320,7 +341,7 @@ pub struct LoserTree<'a, 'stream: 'a, R: Read> {
     path_idxs: Vec<Vec<usize>>,
 }
 
-impl<'a, 'stream: 'a, R: Read> LoserTree<'a, 'stream, R> {
+impl<'a, 'stream: 'a, R: Read + ByteSize> LoserTree<'a, 'stream, R> {
     /// Create a new loser tree from k iterators
     pub fn new(mut iterators: HashMap<usize, TextIterator<'stream, 'a, R>>) -> Self {
         let k = iterators.len();

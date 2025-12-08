@@ -570,11 +570,13 @@ pub fn get_matches_parallel(storage_dir: &PathBuf, match_length: usize) -> Resul
                 })
         });
 
+
     // And set up the matches writers
     let match_writer = MatchWriter::new(&storage_dir.clone().join("matches")).unwrap();
     // Finally we can do the parallel merge thing:
-    thread_iters.par_iter_mut().for_each(|streams| {
-        get_matches_parallel_thread(streams, &match_writer, match_length).unwrap()
+    println!("Starting parallel match-finding...");
+    thread_iters.par_iter_mut().enumerate().for_each(|i, streams| {
+        get_matches_parallel_thread(streams, &match_writer, match_length, ).unwrap()
     });
     match_writer.finish().unwrap();
 
@@ -796,7 +798,17 @@ fn get_matches_parallel_thread<'a>(
     streams: &'a mut HashMap<usize, SAStream<'a, FileRange>>,
     match_writer: &MatchWriter,
     match_length: usize,
+    use_pbar: bool
 ) -> Result<(), Error> {
+
+    let pbar_opt = if use_pbar {
+    	let total_size: usize = streams.iter().map(|(k,v)| {v.byte_size as usize}).sum::<usize>();
+    	let pbar = build_pbar(total_size, "Thread bytes");
+    	Some(pbar)
+    } else {
+    	None
+    };
+
     let stream_iterators: HashMap<usize, TextIterator<FileRange>> = streams
         .iter_mut()
         .map(|(k, v)| (*k, v.text_iter(match_length)))
@@ -808,6 +820,7 @@ fn get_matches_parallel_thread<'a>(
     if prev_min == None {
         return Ok(());
     }
+
 
     let mut prev_min = prev_min.unwrap();
     let mut currently_in_a_run = false;
@@ -829,6 +842,9 @@ fn get_matches_parallel_thread<'a>(
             currently_in_a_run = false;
         }
         prev_min = cur_min;
+        if let Some(ref pbar) = pbar_opt {
+        	pbar.inc(1);
+        }
     }
 
     Ok(())
