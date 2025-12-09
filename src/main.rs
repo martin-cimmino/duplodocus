@@ -772,6 +772,9 @@ enum Commands {
         text: PathBuf,
 
         #[arg(required = true, long)]
+        offset: PathBuf,        
+
+        #[arg(required = true, long)]
         sa_table: PathBuf,
 
         #[arg(long, default_value_t = 500)]
@@ -1022,9 +1025,10 @@ fn main() {
 
         Commands::SaAlt {
             text,
+            offset,
             sa_table,
             match_length,
-        } => alternative_merge(text, sa_table, *match_length),
+        } => alternative_merge(text, offset, sa_table, *match_length),
 
         _ => Ok(()),
     };

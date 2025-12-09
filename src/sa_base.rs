@@ -347,7 +347,9 @@ pub fn pq_serial(storage_dir: &PathBuf, match_length: usize) -> Result<(), Error
     */
     let start_main = Instant::now();
     let text_lookup = make_text_lookups(storage_dir).unwrap();
-    let mut table_streams = make_table_streams(storage_dir, &text_lookup).unwrap();
+    let offset_lookup = make_offset_lookups(storage_dir).unwrap();
+
+    let mut table_streams = make_table_streams(storage_dir, &text_lookup, &offset_lookup).unwrap();
 
     let mut stream_iterators: HashMap<usize, TextIterator<File>> = HashMap::default();
 
@@ -404,7 +406,10 @@ pub fn pq_serial(storage_dir: &PathBuf, match_length: usize) -> Result<(), Error
 	            match_writer
 	                .write(cur_min.source, &cur_min.sa_value.to_le_bytes())
 	                .unwrap();
+	        } else {
+        		println!("Longer thing");
 	        }
+
             match_count.fetch_add(1, Ordering::SeqCst);
             currently_in_a_run = true;
         } else {
@@ -439,8 +444,9 @@ pub fn get_matches_serial(storage_dir: &PathBuf, match_length: usize) -> Result<
     */
     let start_main = Instant::now();
     let text_lookup = make_text_lookups(storage_dir).unwrap();
+    let offset_lookup = make_offset_lookups(storage_dir).unwrap();
     let total_counts: usize = text_lookup.iter().map(|v| v.len()).sum();
-    let mut table_streams = make_table_streams(storage_dir, &text_lookup).unwrap();
+    let mut table_streams = make_table_streams(storage_dir, &text_lookup, &offset_lookup).unwrap();
     let pbar = build_pbar(total_counts, "Count.len");
     let mut stream_iterators: HashMap<usize, TextIterator<File>> = HashMap::default();
 
@@ -522,9 +528,42 @@ fn make_text_lookups(storage_dir: &PathBuf) -> Result<Vec<Vec<u8>>, Error> {
     Ok(text_lookup)
 }
 
+fn make_offset_lookups(storage_dir: &PathBuf) -> Result<Vec<Vec<u64>>, Error> {
+    // Creates a lookup from idx -> offset
+    let offset_pattern = storage_dir.clone().join("offsets").join("offset_part_*");
+    let offset_objects: Vec<PathBuf> = glob(&offset_pattern.to_str().unwrap())
+        .unwrap()
+        .into_iter()
+        .map(|p| p.unwrap())
+        .collect();
+    let max_offset_idx = AtomicUsize::new(0);
+    let offset_data: Vec<(usize, Vec<u64>)> = offset_objects
+        .into_par_iter()
+        .map(|p| {
+            //PAR
+            let offset_idx = get_part_num(&p).unwrap();
+            max_offset_idx.fetch_max(offset_idx, Ordering::SeqCst);
+            (
+                offset_idx,
+                read_u64_vec(&p).unwrap()
+            )
+        })
+        .collect();
+    let mut offset_lookup: Vec<Vec<u64>> = vec![Vec::new(); max_offset_idx.into_inner() + 1];
+    offset_data
+        .into_iter()
+        .for_each(|(idx, v)| offset_lookup[idx] = v);
+
+    Ok(offset_lookup)
+}
+
+
+
+
 fn make_table_streams<'stream, 'a>(
     storage_dir: &PathBuf,
     text_lookup: &'a Vec<Vec<u8>>,
+    offset_lookup: &'a Vec<Vec<u64>>,
 ) -> Result<Vec<SAStream<'a, File>>, Error> {
     let table_pattern = storage_dir.clone().join("table").join("table_part_*");
     let table_objects: Vec<PathBuf> = glob(&table_pattern.to_str().unwrap())
@@ -541,6 +580,7 @@ fn make_table_streams<'stream, 'a>(
             let stream = SAStream::new(
                 open_file,
                 text_lookup[table_idx].as_slice(),
+                offset_lookup[table_idx].as_slice(),
                 table_idx,
                 16384,
             )
@@ -566,13 +606,14 @@ pub fn get_matches_parallel(storage_dir: &PathBuf, match_length: usize) -> Resul
     let start_main = Instant::now();
     println!("Starting match-gathering");
     let text_lookup = make_text_lookups(storage_dir).unwrap();
+	let offset_lookup = make_offset_lookups(storage_dir).unwrap();    
     let thread_count = rayon::current_num_threads();
     // Get a #threads-1 list of internal boundaries to make #threads streams for each part
     let reference_suffices =
         get_reference_suffices(storage_dir, match_length, thread_count, &text_lookup).unwrap();
     // Get a #Parts x #threads streams
     let substreams =
-        get_all_substreams(storage_dir, reference_suffices, match_length, &text_lookup).unwrap();
+        get_all_substreams(storage_dir, reference_suffices, match_length, &text_lookup, &offset_lookup).unwrap();
 
     // And then transpose into a #threads x #Parts grid
     let mut thread_iters: Vec<HashMap<usize, SAStream<FileRange>>> =
@@ -656,11 +697,12 @@ fn get_all_substreams<'a>(
     boundaries: Vec<Vec<u8>>,
     match_length: usize,
     text_lookup: &'a Vec<Vec<u8>>,
+    offset_lookup: &'a Vec<Vec<u64>>,
 ) -> Result<Vec<Vec<SAStream<'a, FileRange>>>, Error> {
     // Creates |thread_count| TextIterators for each SA Table, each offset by a little bit on each end from the boundaries
 
     // Step 1: Get table/text pairs
-    let mut table_text_pairs: Vec<(PathBuf, &Vec<u8>)> = Vec::new();
+    let mut table_text_offset_trips: Vec<(PathBuf, &Vec<u8>, &Vec<u64>)> = Vec::new();
     let table_pattern = storage_dir.clone().join("table").join("table_part_*");
     let table_objects: Vec<PathBuf> = glob(&table_pattern.to_str().unwrap())
         .unwrap()
@@ -669,13 +711,13 @@ fn get_all_substreams<'a>(
         .collect();
     table_objects.into_iter().for_each(|p| {
         let part_num = get_part_num(&p).unwrap();
-        table_text_pairs.push((p, &text_lookup[part_num]));
+        table_text_offset_trips.push((p, &text_lookup[part_num], &offset_lookup[part_num]));
     });
 
-    let output: Vec<Vec<SAStream<FileRange>>> = table_text_pairs
+    let output: Vec<Vec<SAStream<FileRange>>> = table_text_offset_trips
         .into_par_iter()
-        .map(|(table_path, text)| {
-            get_substreams_from_boundaries(&table_path, text, &boundaries, match_length).unwrap()
+        .map(|(table_path, text, offset)| {
+            get_substreams_from_boundaries(&table_path, text, offset, &boundaries, match_length).unwrap()
         })
         .collect();
 
@@ -685,6 +727,7 @@ fn get_all_substreams<'a>(
 fn get_substreams_from_boundaries<'a>(
     table_path: &PathBuf,
     text: &'a Vec<u8>,
+    offset: &'a Vec<u64>,
     boundaries: &Vec<Vec<u8>>,
     match_length: usize,
 ) -> Result<Vec<SAStream<'a, FileRange>>, Error> {
@@ -743,6 +786,7 @@ fn get_substreams_from_boundaries<'a>(
 
     // Then create FileRanges and SAStreams and TextIterators
     let text_slice = text.as_slice();
+    let offset_slice = offset.as_slice();
     let part_num = get_part_num(&table_path).unwrap();
     let sa_streams: Vec<SAStream<FileRange>> = dilated_idxs
         .into_iter()
@@ -754,7 +798,7 @@ fn get_substreams_from_boundaries<'a>(
                 (r * 8).try_into().unwrap(),
             )
             .unwrap();
-            let sas = SAStream::new(file_range, text_slice, part_num, 16384).unwrap();
+            let sas = SAStream::new(file_range, text_slice, offset_slice, part_num, 16384).unwrap();
             sas
         })
         .collect();
@@ -839,21 +883,24 @@ fn get_matches_parallel_thread<'a>(
         return Ok(());
     }
 
-
     let mut prev_min = prev_min.unwrap();
     let mut currently_in_a_run = false;
     while !loser_tree.peek().is_none() {
         let cur_min = loser_tree.pop_check().unwrap().unwrap();
         if cur_min == prev_min {
             if !currently_in_a_run {
-                match_writer
-                    .write(prev_min.source, &prev_min.sa_value.to_le_bytes())
-                    .unwrap();
+            	if !cur_min.prev_char_same(&prev_min) {
+	                match_writer
+	                    .write(prev_min.source, &prev_min.sa_value.to_le_bytes())
+	                    .unwrap();
+	            }
                 match_count.fetch_add(1, Ordering::SeqCst);
             }
-            match_writer
-                .write(cur_min.source, &cur_min.sa_value.to_le_bytes())
-                .unwrap();
+            if !cur_min.prev_char_same(&prev_min) {
+	            match_writer
+	                .write(cur_min.source, &cur_min.sa_value.to_le_bytes())
+	                .unwrap();            	
+	            }
             match_count.fetch_add(1, Ordering::SeqCst);
             currently_in_a_run = true;
         } else {
@@ -874,6 +921,7 @@ fn get_matches_parallel_thread<'a>(
 
 pub fn alternative_merge(
     text_loc: &PathBuf,
+    offset_loc: &PathBuf,
     sa_table_loc: &PathBuf,
     match_length: usize,
 ) -> Result<(), Error> {
@@ -885,11 +933,14 @@ pub fn alternative_merge(
         .into_inner()
         .into_inner();
     let text_slice: &[u8] = text.as_slice();
+
+    let offset = read_u64_vec(offset_loc).unwrap();   
+    let offset_slice: &[u64] = offset.as_slice();    
     //let sa_table: Vec<u64> = read_u64_vec(sa_table_loc).unwrap();
     //let table_len = sa_table.len();
     let mut matches: Vec<u64> = Vec::new();
     let open_sa = File::open(sa_table_loc).unwrap();
-    let mut stream = SAStream::new(open_sa, text_slice, 0, 16384).unwrap();
+    let mut stream = SAStream::new(open_sa, text_slice, offset_slice, 0, 16384).unwrap();
     let mut text_iterator = stream.text_iter(match_length);
     let prev_min = text_iterator.next();
     if prev_min.is_none() {

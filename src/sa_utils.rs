@@ -125,6 +125,7 @@ impl ByteSize for FileRange {
 pub struct SAStream<'a, R: Read + ByteSize> {
     pub reader: BufReader<R>,
     pub text: &'a [u8],
+    pub offset: &'a [u64], 
     pub buffer: Vec<u64>,
     pub position: usize,
     pub chunk_size: usize,
@@ -133,12 +134,13 @@ pub struct SAStream<'a, R: Read + ByteSize> {
 }
 
 impl<'a, R: Read + ByteSize> SAStream<'a, R> {
-    pub fn new(sa_file: R, text: &'a [u8], source: usize, chunk_size: usize) -> Result<Self, Error> {
+    pub fn new(sa_file: R, text: &'a [u8], offset: &'a[u64], source: usize, chunk_size: usize) -> Result<Self, Error> {
     	let byte_size = sa_file.byte_size().unwrap();
 
         Ok(Self {
             reader: BufReader::new(sa_file),
             text: text,
+            offset: offset,
             buffer: Vec::with_capacity(chunk_size),
             position: 0,
             chunk_size,
@@ -220,7 +222,13 @@ impl<'stream, 'a, R: Read + ByteSize> Iterator for TextIterator<'stream, 'a, R> 
                 if next_idx as usize + self.min_len >= self.stream.text.len() {
                     continue;
                 }
-                let slice = &self.stream.text[next_idx as usize..next_idx as usize + self.min_len];
+                let next_eos = self.next_eos(next_idx as usize).unwrap() as usize;
+                //println!("NEXT IDX {:?} | NEXT EOS {:?} | GAP {:?}", next_idx, next_eos, next_eos - next_idx as usize);
+                if next_eos < next_idx as usize + self.min_len {
+                	continue
+                }
+                let slice_end = std::cmp::min(next_eos, next_idx as usize + self.min_len);
+                let slice = &self.stream.text[next_idx as usize..slice_end];
                 //let sv : SmallVec<[u8; 512]> = SmallVec::from_slice(&slice);
                 let prev_char: Option<u8> = if next_idx > 0 {
                 	let prev_char = (&self.stream.text.get(next_idx as usize - 1)).clone().unwrap();
@@ -241,6 +249,30 @@ impl<'stream, 'a, R: Read + ByteSize> Iterator for TextIterator<'stream, 'a, R> 
         }
         None
     }
+
+}
+
+impl<'stream, 'a, R: Read + ByteSize> TextIterator<'stream, 'a, R> {
+	pub fn next_eos(&self, idx: usize) -> Result<u64, Error> {
+		// Gets the next element in the offset array that is >= idx, using binary search
+		let offset: &[u64] = self.stream.offset;
+        // Binary search for the first element >= idx
+        let mut left = 0;
+        let mut right = offset.len() / 3;
+
+        while left < right {
+            let mid = left + (right - left) / 2;
+            
+            if offset[mid * 3 + 2] < idx as u64 {
+                // Element at mid is too small, search right half
+                left = mid + 1;
+            } else {
+                // Element at mid could be the answer, search left half
+                right = mid;
+            }
+        }
+        Ok(*offset.get(left * 3+ 2).unwrap())
+	}
 }
 
 /*====================================================================
@@ -322,9 +354,14 @@ pub struct TreeNode<'a> {
 }
 impl TreeNode<'_> {
 	pub fn prev_char_same(&self, other: &TreeNode)  -> bool {
+
 		match (&self.prev_char, other.prev_char) {
 			(None, None) => false,
-			(a, b) => *a == b
+			(Some(_), None) => false,
+			(None, Some(_)) => false,
+			(Some(a), Some(b)) => {
+				*a == b
+			}
 		}		
 	}
 }
