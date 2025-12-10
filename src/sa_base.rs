@@ -635,7 +635,7 @@ pub fn get_matches_parallel(storage_dir: &PathBuf, match_length: usize) -> Resul
     let match_writer = MatchWriter::new(&storage_dir.clone().join("matches")).unwrap();
     // Finally we can do the parallel merge thing:
     println!("Starting parallel match-finding...");
-    pbar = build_pbar()
+    //pbar = build_pbar()
     thread_iters.par_iter_mut().enumerate().for_each(|(i, streams)| {
         get_matches_parallel_thread(streams, &match_writer, match_length, i==0 ).unwrap()
     });
