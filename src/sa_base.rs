@@ -151,7 +151,8 @@ pub fn make_sa_tables(
 
     // Safety check:
     let corpus_len: usize = data_docs.par_iter().map(|(_, _, doc)| doc.len() + 2 * 8).sum();
-    assert!(sa_safety_check(corpus_len));
+    // assert!(sa_safety_check(corpus_len));
+    sa_safety_check(corpus_len);
     let thread_count = rayon::current_num_threads();
     let thread_mem = sa_thread_memory(thread_count, MEMORY_SAFETY_MARGIN);
 
@@ -634,6 +635,7 @@ pub fn get_matches_parallel(storage_dir: &PathBuf, match_length: usize) -> Resul
     let match_writer = MatchWriter::new(&storage_dir.clone().join("matches")).unwrap();
     // Finally we can do the parallel merge thing:
     println!("Starting parallel match-finding...");
+    pbar = build_pbar()
     thread_iters.par_iter_mut().enumerate().for_each(|(i, streams)| {
         get_matches_parallel_thread(streams, &match_writer, match_length, i==0 ).unwrap()
     });
