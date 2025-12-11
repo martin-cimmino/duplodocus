@@ -114,11 +114,9 @@ impl<'s, 't> SuffixTable<'s, 't> {
         let text = text.into();
         let mut sys = System::new_all();
         sys.refresh_memory();        
-        println!("PRE SA STATS | {:?} textlen | {:?} memory used", text.len(), sys.used_memory());                 
         let table = Cow::Owned(sais_table(&text));
         let mut sys = System::new_all();
         sys.refresh_memory();        
-        println!("POST SA STATS | {:?} memory used", sys.used_memory());
         SuffixTable {
             text: text,
             table: table,

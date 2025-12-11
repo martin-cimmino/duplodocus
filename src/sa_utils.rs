@@ -44,7 +44,7 @@ pub fn sa_safety_check(text_len: usize) -> bool {
 	sys.refresh_memory();
 	let total_memory = sys.total_memory();
 
-	let predicted_ram_usage = text_len * 9;
+	let predicted_ram_usage = text_len * 12;
 	println!("Expecting to use at least {:.2}% of the RAM", predicted_ram_usage as f64 / total_memory as f64 * 100.0);
 
 
@@ -223,13 +223,11 @@ impl<'stream, 'a, R: Read + ByteSize> Iterator for TextIterator<'stream, 'a, R> 
                     continue;
                 }
                 let next_eos = self.next_eos(next_idx as usize).unwrap() as usize;
-                //println!("NEXT IDX {:?} | NEXT EOS {:?} | GAP {:?}", next_idx, next_eos, next_eos - next_idx as usize);
                 if next_eos < next_idx as usize + self.min_len {
                 	continue
                 }
                 let slice_end = std::cmp::min(next_eos, next_idx as usize + self.min_len);
                 let slice = &self.stream.text[next_idx as usize..slice_end];
-                //let sv : SmallVec<[u8; 512]> = SmallVec::from_slice(&slice);
                 let prev_char: Option<u8> = if next_idx > 0 {
                 	let prev_char = (&self.stream.text.get(next_idx as usize - 1)).clone().unwrap();
                 	Some(*prev_char)
