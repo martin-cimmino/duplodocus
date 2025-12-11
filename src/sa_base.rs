@@ -31,7 +31,7 @@ use std::path::PathBuf;
 use std::cmp::Ordering as StdOrdering;
 use std::collections::BinaryHeap;
 
-use crate::sa_utils::{FileRange, SAStream, TextIterator, MatchWriter, TreeNode, LoserTree, read_u64_vec, sa_safety_check, sa_thread_memory};
+use crate::sa_utils::{FileRange, SAStream, TextIterator, MatchWriter, TreeNode, LoserTree, read_u64_vec, sa_safety_check, calculate_bytes_per_chunk};
 use crate::sa_config::{SAConfigOverrides, SAConfig};
 
 /*
@@ -155,7 +155,8 @@ pub fn make_sa_tables(
     // assert!(sa_safety_check(corpus_len));
     sa_safety_check(corpus_len);
     let thread_count = rayon::current_num_threads();
-    let thread_mem = sa_thread_memory(thread_count, MEMORY_SAFETY_MARGIN);
+    let chunk_text_byte_size = calculate_bytes_per_chunk(thread_count, MEMORY_SAFETY_MARGIN);
+
 
 
 
@@ -164,7 +165,15 @@ pub fn make_sa_tables(
 
 
     // Step 3: Break into chunks and make SA table for each of them
-    let owned_chunks: DashMap<usize, Vec<(usize, usize, String)>> = chunk_data_for_sa(config_obj, data_docs, thread_mem, thread_count);
+    let owned_chunks: DashMap<usize, Vec<(usize, usize, String)>> = chunk_data_for_sa(config_obj, data_docs, chunk_text_byte_size, thread_count);
+
+    // PRINT BLOCK
+    let chunk_sizes: Vec<usize> = owned_chunks.par_iter().map(|entry| {
+    	let v = entry.value();
+    	v.iter().map(|(_, _, t)| t.len()).sum::<usize>()
+    }).collect();
+
+    println!("CHUNK BYTE LIMIT {:?} | CHUNK SIZES {:?}", chunk_text_byte_size, chunk_sizes); 
     let total_bytes = AtomicUsize::new(0);
 
     let total_pbar = build_pbar(owned_chunks.len() * 4, "Total steps");
@@ -273,11 +282,10 @@ fn get_part_num(path: &PathBuf) -> Result<usize, Error> {
 fn chunk_data_for_sa(
     config: &SAConfig, 
     data_docs: Vec<(usize, usize, String)>, 
-    thread_memory: usize, 
+    bytes_per_chunk: usize,
     thread_count: usize
 ) -> DashMap<usize, Vec<(usize, usize, String)>> {
     let owned_chunks: DashMap<usize, Vec<(usize, usize, String)>> = DashMap::new();
-    let chunk_limit = thread_memory / 9;
 
     // Step 1: shuffle and index the data
     let mut indexed: Vec<(u64, (usize, usize, String))> = data_docs
@@ -311,9 +319,9 @@ fn chunk_data_for_sa(
 
         for (_, (idx1, idx2, text)) in chunk {
             let item_size = text.len() + 16; // approximate overhead
-            assert!(item_size < chunk_limit, "Document too large for chunk limit!");
+            assert!(item_size < bytes_per_chunk, "Document too large for chunk limit!");
             
-            if current_size + item_size > chunk_limit && current_size > 0 {
+            if current_size + item_size > bytes_per_chunk && current_size > 0 {
                 // Flush current chunk
                 owned_chunks.insert(current_part, current_chunk);
                 current_chunk = Vec::new();
@@ -330,9 +338,10 @@ fn chunk_data_for_sa(
             owned_chunks.insert(current_part, current_chunk);
         }
     });
-
     owned_chunks
 }
+
+
 
 /*============================================================
 =                            PQ LOOPS                        =

@@ -62,6 +62,24 @@ pub fn sa_thread_memory(num_threads: usize, safety_margin: f64) -> usize {
 
 }
 
+
+pub fn calculate_bytes_per_chunk(num_threads: usize, safety_margin: f64) -> usize {
+	/* Computes number of bytes of text each chunk should handle
+	
+	Let's set a cap of safety_margin * total_memory 
+	and then let M = cap - used_memory // assumes text is already loaded!
+
+	return M / (|num_threads| * 11) // 11 is just a rough "overhead cost per SA tabl"
+	*/
+
+	let mut sys = System::new_all();
+	sys.refresh_memory();
+	let cap: u64 = (sys.total_memory() as f64 * safety_margin) as u64;
+	let free_memory = cap - sys.used_memory();
+
+	(free_memory as usize / (num_threads * 11)) as usize
+}
+
 /*======================================================================
 =                            FILE STREAM STUFF                         =
 ======================================================================*/
