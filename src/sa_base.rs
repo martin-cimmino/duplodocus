@@ -144,6 +144,7 @@ pub fn make_sa_tables(
     println!("Reading all documents texts...");
     let data_docs = load_data_docs(file_map, config_obj, input_dir).unwrap();
     println!(" {:?} DOCS TOTAL", data_docs.len());
+    println!(" {:?} Bytes of text total", data_docs.par_iter().map(|(_, _, s)| s.len()).sum::<usize>());
     println!(
         "...Read all documents in {:?} secs",
         start_read.elapsed().as_secs()
