@@ -286,7 +286,7 @@ fn chunk_data_for_sa(
     thread_count: usize
 ) -> DashMap<usize, Vec<(usize, usize, String)>> {
     let owned_chunks: DashMap<usize, Vec<(usize, usize, String)>> = DashMap::new();
-
+    let chunk_counter = AtomicUsize::new(0);
     // Step 1: shuffle and index the data
     let mut indexed: Vec<(u64, (usize, usize, String))> = data_docs
         .into_par_iter()
@@ -312,8 +312,8 @@ fn chunk_data_for_sa(
     });
 
     // Step 3: split each bucket into memory-bounded chunks
-    chunks.into_par_iter().enumerate().for_each(|(chunk_id, chunk)| {
-        let mut current_part = chunk_id;
+    chunks.into_par_iter().for_each(|chunk| {
+        let mut current_part = chunk_counter.fetch_add(1, Ordering::SeqCst);
         let mut current_size = 0;
         let mut current_chunk = Vec::new();
 
@@ -326,7 +326,7 @@ fn chunk_data_for_sa(
                 owned_chunks.insert(current_part, current_chunk);
                 current_chunk = Vec::new();
                 current_size = 0;
-                current_part += thread_count;
+                current_part = chunk_counter.fetch_add(1, Ordering::SeqCst);
             }
             
             current_chunk.push((idx1, idx2, text));
@@ -467,7 +467,7 @@ pub fn get_matches_serial(storage_dir: &PathBuf, match_length: usize) -> Result<
 
     /* Step 2: Initialize min-order data structure
     	*/
-    let mut loser_tree = LoserTree::new(stream_iterators);
+    let mut loser_tree = LoserTree::new(stream_iterators, None);
     let match_writer = MatchWriter::new(&storage_dir.clone().join("matches")).unwrap();
     let match_count = AtomicUsize::new(0);
     let prev_min = loser_tree.pop().unwrap();
@@ -876,7 +876,7 @@ fn get_matches_parallel_thread<'a>(
 ) -> Result<(), Error> {
 
     let pbar_opt = if use_pbar {
-    	let total_size: usize = streams.iter().map(|(k,v)| {v.byte_size as usize}).sum::<usize>();
+    	let total_size: usize = streams.iter().map(|(_k,v)| v.byte_size as usize).sum::<usize>();
     	let pbar = build_pbar(total_size, "Thread bytes");
     	Some(pbar)
     } else {
@@ -888,13 +888,12 @@ fn get_matches_parallel_thread<'a>(
         .map(|(k, v)| (*k, v.text_iter(match_length)))
         .collect();
 
-    let mut loser_tree = LoserTree::new(stream_iterators);
+    let mut loser_tree = LoserTree::new(stream_iterators, pbar_opt);
     let match_count = AtomicUsize::new(0);
     let prev_min = loser_tree.pop().unwrap();
     if prev_min == None {
         return Ok(());
     }
-
     let mut prev_min = prev_min.unwrap();
     let mut currently_in_a_run = false;
     while !loser_tree.peek().is_none() {
@@ -919,9 +918,6 @@ fn get_matches_parallel_thread<'a>(
             currently_in_a_run = false;
         }
         prev_min = cur_min;
-        if let Some(ref pbar) = pbar_opt {
-        	pbar.inc(1);
-        }
     }
 
     Ok(())

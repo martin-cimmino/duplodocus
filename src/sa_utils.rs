@@ -17,7 +17,7 @@ use anyhow::{Context, Error, Result};
 use rayon;
 use rayon::prelude::*;
 use std::path::PathBuf;
-
+use indicatif::ProgressBar;
 use std::cmp::Ordering as StdOrdering;
 use sysinfo::System;
 
@@ -289,7 +289,45 @@ impl<'stream, 'a, R: Read + ByteSize> TextIterator<'stream, 'a, R> {
         }
         Ok(*offset.get(left * 3+ 2).unwrap())
 	}
+
+    fn next_counter(&mut self) -> (u64, Option<Result<TreeNode<'a>, Error>>) {
+        let mut loop_counter: u64 = 0;
+        loop {
+            loop_counter += 1;
+            let next_idx_opt = self.stream.next();
+            if let Some(next_idx) = next_idx_opt {
+                let next_idx = next_idx.unwrap();
+                if next_idx as usize + self.min_len >= self.stream.text.len() {
+                    continue;
+                }
+                let next_eos = self.next_eos(next_idx as usize).unwrap() as usize;
+                if next_eos < next_idx as usize + self.min_len {
+                    continue
+                }
+                let slice_end = std::cmp::min(next_eos, next_idx as usize + self.min_len);
+                let slice = &self.stream.text[next_idx as usize..slice_end];
+                let prev_char: Option<u8> = if next_idx > 0 {
+                    let prev_char = (&self.stream.text.get(next_idx as usize - 1)).clone().unwrap();
+                    Some(*prev_char)
+                } else {
+                    None
+                };               
+
+                return (loop_counter, Some(Ok(TreeNode {
+                    sa_value: next_idx,
+                    cmp_bytes: slice,
+                    source: self.stream.source,
+                    prev_char: prev_char
+                })));
+            } else {
+                return (loop_counter, None);
+            }
+        }
+    }
 }
+
+
+
 
 /*====================================================================
 =                           MATCH WRITER THING                       =
@@ -409,11 +447,12 @@ pub struct LoserTree<'a, 'stream: 'a, R: Read + ByteSize> {
     pub shortcut_count: usize,
     iterators: HashMap<usize, TextIterator<'stream, 'a, R>>, // Input sequences
     path_idxs: Vec<Vec<usize>>,
+    pbar_opt: Option<ProgressBar>,
 }
 
 impl<'a, 'stream: 'a, R: Read + ByteSize> LoserTree<'a, 'stream, R> {
     /// Create a new loser tree from k iterators
-    pub fn new(mut iterators: HashMap<usize, TextIterator<'stream, 'a, R>>) -> Self {
+    pub fn new(mut iterators: HashMap<usize, TextIterator<'stream, 'a, R>>, pbar_opt: Option<ProgressBar>) -> Self {
         let k = iterators.len();
 
         // Tree needs k-1 internal nodes for k leaves
@@ -423,8 +462,12 @@ impl<'a, 'stream: 'a, R: Read + ByteSize> LoserTree<'a, 'stream, R> {
         // Initialize leaves with first element from each iterator
         let mut leaves: Vec<Option<TreeNode<'a>>> = (0..k)
             .map(|source| {
-                if let Some(iter) = iterators.get_mut(&source) {
-                    if let Some(node) = iter.next() {
+                if let Some(iter) = iterators.get_mut(&source) {        
+                    let (counter, next_el) = iter.next_counter();
+                    if let Some(ref pbar) = pbar_opt {
+                        pbar.inc(counter);
+                    }
+                    if let Some(node) = next_el {
                         Some(node.unwrap())
                     } else {
                         None
@@ -450,6 +493,7 @@ impl<'a, 'stream: 'a, R: Read + ByteSize> LoserTree<'a, 'stream, R> {
             iterators,
             path_idxs,
             shortcut_count,
+            pbar_opt
         }
     }
 
@@ -512,12 +556,15 @@ impl<'a, 'stream: 'a, R: Read + ByteSize> LoserTree<'a, 'stream, R> {
         self.loser.as_ref()
     }
 
+
+
     /// Extract the minimum element and advance the tree
     pub fn pop(&mut self) -> Result<Option<TreeNode<'a>>, Error> {
         let loser = self.loser.take().unwrap();
         let source = loser.source;
-
-        let new_tree_entry = if let Some(node) = self.iterators.get_mut(&source).unwrap().next() {
+        let (counter, next_el) = self.iterators.get_mut(&source).unwrap().next_counter();
+        self.inc_pbar_opt(counter);
+        let new_tree_entry = if let Some(node) = next_el {
             Some(node.unwrap())
         } else {
             None
@@ -531,8 +578,11 @@ impl<'a, 'stream: 'a, R: Read + ByteSize> LoserTree<'a, 'stream, R> {
         let loser = self.loser.take().unwrap();
         let loser_source = loser.source;
 
+        let (counter, next_el) = self.iterators.get_mut(&loser_source).unwrap().next_counter();
+        self.inc_pbar_opt(counter);
+
         let new_tree_entry =
-            if let Some(node) = self.iterators.get_mut(&loser_source).unwrap().next() {
+            if let Some(node) = next_el {
                 let new_node = node.unwrap();
                 match self.tree.last() {
                     Some(None) => {
@@ -562,8 +612,10 @@ impl<'a, 'stream: 'a, R: Read + ByteSize> LoserTree<'a, 'stream, R> {
     pub fn pop_verbose(&mut self) -> Result<Option<TreeNode<'a>>, Error> {
         let loser = self.loser.take().unwrap();
         let source = loser.source;
+        let (counter, next_el) = self.iterators.get_mut(&source).unwrap().next_counter();
+        self.inc_pbar_opt(counter);
 
-        let new_tree_entry = if let Some(node) = self.iterators.get_mut(&source).unwrap().next() {
+        let new_tree_entry = if let Some(node) = next_el {
             Some(node.unwrap())
         } else {
             None
@@ -659,5 +711,11 @@ impl<'a, 'stream: 'a, R: Read + ByteSize> LoserTree<'a, 'stream, R> {
         }
 
         total
+    }
+
+    fn inc_pbar_opt(&self, inc: u64) -> () {
+        if let Some(ref pbar) = self.pbar_opt {
+            pbar.inc(inc);
+        }
     }
 }
