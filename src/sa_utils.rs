@@ -196,6 +196,7 @@ impl<'a, R: Read + ByteSize> SAStream<'a, R> {
     pub fn text_iter<'stream>(&'stream mut self, min_len: usize) -> TextIterator<'stream, 'a, R> {
         TextIterator {
             stream: self,
+            next_call_counter: 0 as u64,
             min_len,
         }
     }
@@ -225,6 +226,7 @@ impl<'a, R: Read + ByteSize> Iterator for SAStream<'a, R> {
 
 pub struct TextIterator<'stream, 'a, R: Read> where R: ByteSize, R: ByteSize {
     stream: &'stream mut SAStream<'a, R>,
+    pub next_call_counter: u64,
     min_len: usize,
 }
 
@@ -234,6 +236,7 @@ impl<'stream, 'a, R: Read + ByteSize> Iterator for TextIterator<'stream, 'a, R> 
     type Item = Result<TreeNode<'a>, Error>;
     fn next(&mut self) -> Option<Self::Item> {
         loop {
+            self.next_call_counter += 1;
             let next_idx_opt = self.stream.next();
             if let Some(next_idx) = next_idx_opt {
                 let next_idx = next_idx.unwrap();
@@ -246,6 +249,7 @@ impl<'stream, 'a, R: Read + ByteSize> Iterator for TextIterator<'stream, 'a, R> 
                 }
                 let slice_end = std::cmp::min(next_eos, next_idx as usize + self.min_len);
                 let slice = &self.stream.text[next_idx as usize..slice_end];
+                let rest_of_doc = &self.stream.text[slice_end..next_eos];
                 let prev_char: Option<u8> = if next_idx > 0 {
                 	let prev_char = (&self.stream.text.get(next_idx as usize - 1)).clone().unwrap();
                 	Some(*prev_char)
@@ -254,10 +258,12 @@ impl<'stream, 'a, R: Read + ByteSize> Iterator for TextIterator<'stream, 'a, R> 
                 };               
 
                 return Some(Ok(TreeNode {
+                    sa_idx: self.next_call_counter - 1,
                     sa_value: next_idx,
                     cmp_bytes: slice,
                     source: self.stream.source,
-                    prev_char: prev_char
+                    prev_char: prev_char,
+                    rest_of_doc: rest_of_doc,
                 }));
             } else {
                 return None;
@@ -293,19 +299,21 @@ impl<'stream, 'a, R: Read + ByteSize> TextIterator<'stream, 'a, R> {
     fn next_counter(&mut self) -> (u64, Option<Result<TreeNode<'a>, Error>>) {
         let mut loop_counter: u64 = 0;
         loop {
+            self.next_call_counter += 1;
             loop_counter += 1;
             let next_idx_opt = self.stream.next();
             if let Some(next_idx) = next_idx_opt {
                 let next_idx = next_idx.unwrap();
-                if next_idx as usize + self.min_len >= self.stream.text.len() {
+                if next_idx as usize + self.min_len >= self.stream.text.len() { // overruns the endpoint of the stream, skip
                     continue;
                 }
-                let next_eos = self.next_eos(next_idx as usize).unwrap() as usize;
-                if next_eos < next_idx as usize + self.min_len {
+                let next_eos = self.next_eos(next_idx as usize).unwrap() as usize;                
+                if next_eos < next_idx as usize + self.min_len { // overruns the endpoint of the doc, skip
                     continue
                 }
-                let slice_end = std::cmp::min(next_eos, next_idx as usize + self.min_len);
+                let slice_end = std::cmp::min(next_eos, next_idx as usize + self.min_len);                
                 let slice = &self.stream.text[next_idx as usize..slice_end];
+                let rest_of_doc = &self.stream.text[slice_end..next_eos];                
                 let prev_char: Option<u8> = if next_idx > 0 {
                     let prev_char = (&self.stream.text.get(next_idx as usize - 1)).clone().unwrap();
                     Some(*prev_char)
@@ -314,10 +322,12 @@ impl<'stream, 'a, R: Read + ByteSize> TextIterator<'stream, 'a, R> {
                 };               
 
                 return (loop_counter, Some(Ok(TreeNode {
+                    sa_idx: self.next_call_counter - 1,
                     sa_value: next_idx,
                     cmp_bytes: slice,
                     source: self.stream.source,
-                    prev_char: prev_char
+                    prev_char: prev_char,
+                    rest_of_doc: rest_of_doc
                 })));
             } else {
                 return (loop_counter, None);
@@ -332,6 +342,55 @@ impl<'stream, 'a, R: Read + ByteSize> TextIterator<'stream, 'a, R> {
 /*====================================================================
 =                           MATCH WRITER THING                       =
 ====================================================================*/
+
+pub struct MatchWriterElement {
+    pub source: usize,
+    pub part_num: u64,
+    pub sa_idx: u64,
+    pub sa_value: u64, 
+    pub lcp: u64, 
+    pub first_run_el: bool,
+}
+
+impl MatchWriterElement {
+    pub const MATCH_EL_SIZE : usize = 33;
+
+    pub fn write_bytes(&self, buffer: &mut [u8]) {
+        // Write directly into a pre-allocated buffer
+        // No bounds checking needed if buffer is guaranteed to be correct size
+        buffer[0..8].copy_from_slice(&self.part_num.to_le_bytes());
+        buffer[8..16].copy_from_slice(&self.sa_idx.to_le_bytes());
+        buffer[16..24].copy_from_slice(&self.sa_value.to_le_bytes());
+        buffer[24..32].copy_from_slice(&self.lcp.to_le_bytes());
+        buffer[32] = self.first_run_el as u8;
+    }
+    
+    pub fn into_bytes(self) -> (usize, Vec<u8>) {
+        // Returns (source, rest written as bytes)
+        let mut packed_bytes = vec![0u8; Self::MATCH_EL_SIZE];
+        self.write_bytes(&mut packed_bytes);
+        (self.source, packed_bytes)
+    }
+
+    pub fn from_bytes(source: usize, bytes: &[u8]) -> Self {
+        // Invert the `into_bytes` method
+        // Assumes bytes.len() == SERIALIZED_SIZE
+        
+        // Using unsafe for maximum performance - avoid bounds checks
+        unsafe {
+            MatchWriterElement {
+                source,
+                part_num: u64::from_le_bytes(*(bytes.as_ptr() as *const [u8; 8])),
+                sa_idx: u64::from_le_bytes(*(bytes.as_ptr().add(8) as *const [u8; 8])),
+                sa_value: u64::from_le_bytes(*(bytes.as_ptr().add(16) as *const [u8; 8])),
+                lcp: u64::from_le_bytes(*(bytes.as_ptr().add(24) as *const [u8; 8])),
+                first_run_el: *bytes.get_unchecked(32) != 0,
+            }
+        }
+    }    
+}
+
+
 
 pub struct MatchWriter {
     pub writer: DashMap<usize, Arc<Mutex<BufWriter<File>>>>,
@@ -365,18 +424,20 @@ impl MatchWriter {
         Ok(output)
     }
 
-    pub fn write(&self, idx: usize, bytes: &[u8]) -> Result<(), Error> {
-        let buf_writer_arc = if let Some(buf_writer_arc) = self.writer.get(&idx) {
+
+    pub fn write_element(&self, element: MatchWriterElement) -> Result<(), Error> {
+        let (source, bytes) = element.into_bytes();
+        let buf_writer_arc = if let Some(buf_writer_arc) = self.writer.get(&source) {
             buf_writer_arc
         } else {
-            let buf_writer_arc = self.make_new_writer(idx).unwrap();
-            self.writer.insert(idx, buf_writer_arc);
-            self.writer.get(&idx).unwrap()
+            let buf_writer_arc = self.make_new_writer(source).unwrap();
+            self.writer.insert(source, buf_writer_arc);
+            self.writer.get(&source).unwrap()
         };
-
-        buf_writer_arc.lock().unwrap().write(bytes).unwrap();
+        buf_writer_arc.lock().unwrap().write(&bytes).unwrap();
         Ok(())
     }
+
 
     pub fn finish(&self) -> Result<(), Error> {
         self.writer
@@ -393,6 +454,14 @@ impl MatchWriter {
 }
 
 
+pub struct MergedWriterElement {
+    pub doc_id: usize,
+    pub line_num: usize,
+    pub start_idx: usize,
+    pub lcp: usize, 
+    pub safe: bool,
+}
+
 
 /*========================================================
 =                            LOSER TREE STUFF            =
@@ -401,10 +470,12 @@ impl MatchWriter {
 /// Represents an element in the loser tree along with its source sequence index
 #[derive(Debug, Clone)]
 pub struct TreeNode<'a> {
-    pub sa_value: u64,       // value 1 that the object holds
-    pub cmp_bytes: &'a [u8], // value 2 that the object holds
+    pub sa_idx: u64, // actual index into the suffix array 
+    pub sa_value: u64,       // contents of the suffix array at sa_idx
+    pub cmp_bytes: &'a [u8], // first min_len bytes of the text pointed to by sa_value
     pub source: usize,       // which input stream this came from
-    pub prev_char: Option<u8>     // the byte that occurs BEFORE this one in the stream (if it exists)
+    pub prev_char: Option<u8>,     // the byte that occurs BEFORE this one in the stream (if it exists)
+    pub rest_of_doc: &'a [u8] // rest of the document (continuation of cmp_bytes)
 }
 impl TreeNode<'_> {
 	pub fn prev_char_same(&self, other: &TreeNode)  -> bool {
@@ -422,7 +493,12 @@ impl TreeNode<'_> {
 
 impl Ord for TreeNode<'_> {
     fn cmp(&self, other: &Self) -> StdOrdering {
-        self.cmp_bytes.cmp(&other.cmp_bytes)
+        let order = self.cmp_bytes.cmp(&other.cmp_bytes);
+        if order == StdOrdering::Equal {
+            self.source.cmp(&other.source)            
+        } else {
+            order
+        }
     }
 }
 
@@ -434,11 +510,28 @@ impl PartialOrd for TreeNode<'_> {
 
 impl PartialEq for TreeNode<'_> {
     fn eq(&self, other: &Self) -> bool {
-        self.cmp_bytes == other.cmp_bytes
+        (self.cmp_bytes == other.cmp_bytes) && (self.source == other.source)
     }
 }
 
 impl Eq for TreeNode<'_> {}
+
+
+impl <'a> TreeNode<'a> {
+    pub fn cmp_eq(&self, other: &TreeNode) -> bool {
+        self.cmp_bytes == other.cmp_bytes
+    }
+
+    pub fn lcp(&self, other: &TreeNode, min_len: usize) -> u64 {
+        (min_len + self.rest_of_doc.iter()
+            .zip(other.rest_of_doc.iter())
+            .take_while(|(x, y)| x == y)
+            .count()) as u64
+    }
+}
+
+
+
 
 /// Loser Tree for efficient k-way merging
 pub struct LoserTree<'a, 'stream: 'a, R: Read + ByteSize> {

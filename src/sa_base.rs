@@ -2,7 +2,7 @@ use rand::SeedableRng;
 use rand::Rng;
 use rand_chacha::ChaCha8Rng;
 use crate::minhash_base::FileMap;
-use crate::utils::json_set;
+use crate::utils::{json_set, json_get};
 use ahash::HashMap;
 use dashmap::DashMap;
 use glob::glob;
@@ -31,7 +31,7 @@ use std::path::PathBuf;
 use std::cmp::Ordering as StdOrdering;
 use std::collections::BinaryHeap;
 
-use crate::sa_utils::{FileRange, SAStream, TextIterator, MatchWriter, TreeNode, LoserTree, read_u64_vec, sa_safety_check, calculate_bytes_per_chunk};
+use crate::sa_utils::{FileRange, SAStream, TextIterator, MatchWriter, MatchWriterElement, TreeNode, LoserTree, read_u64_vec, sa_safety_check, calculate_bytes_per_chunk, ByteSize};
 use crate::sa_config::{SAConfigOverrides, SAConfig};
 
 /*
@@ -347,103 +347,6 @@ fn chunk_data_for_sa(
 =                            PQ LOOPS                        =
 ============================================================*/
 
-pub fn pq_serial(storage_dir: &PathBuf, match_length: usize) -> Result<(), Error> {
-    /* Step 1:
-    Load into memory:
-        - file map
-        - global offset file
-        - all text files
-        - all offset files
-    And open stream readers from SA tables
-    */
-    let start_main = Instant::now();
-    let text_lookup = make_text_lookups(storage_dir).unwrap();
-    let offset_lookup = make_offset_lookups(storage_dir).unwrap();
-
-    let mut table_streams = make_table_streams(storage_dir, &text_lookup, &offset_lookup).unwrap();
-
-    let mut stream_iterators: HashMap<usize, TextIterator<File>> = HashMap::default();
-
-    table_streams.iter_mut().for_each(|s| {
-        stream_iterators.insert(s.source, s.text_iter(match_length));
-    });
-
-    /* Step 2: Initialize min-order data structure
-    	*/
-
-    let mut pq: BinaryHeap<Reverse<TreeNode>> = BinaryHeap::new();
-    for (_source, iterator) in stream_iterators.iter_mut() {
-        if let Some(node) = iterator.next() {
-            let node = node.unwrap();
-            pq.push(Reverse(node));
-        }
-    }
-    if pq.len() == 0 {
-        return Ok(());
-    }
-
-    // Pop one out and put one back from its stream
-    let mut prev_min = pq.pop().unwrap().0;
-    let prev_min_source = prev_min.source;
-    if let Some(node) = stream_iterators.get_mut(&prev_min_source).unwrap().next() {
-        let node = node.unwrap();
-        pq.push(Reverse(node));
-    }
-
-    let mut stream_runs = 0;
-    let mut total_steps = 0;
-    /* Step 3: Now do the loop
-    	*/
-    let match_writer = MatchWriter::new(&storage_dir.clone().join("matches")).unwrap();
-    let match_count = AtomicUsize::new(0);
-    let mut currently_in_a_run = false;
-    while pq.len() > 0 {
-        let cur_min = pq.pop().unwrap().0;
-        total_steps += 1;
-        if cur_min.source == prev_min.source {
-            stream_runs += 1;
-        }
-
-        if cur_min == prev_min {
-            if !currently_in_a_run {
-            	if !cur_min.prev_char_same(&prev_min) {
-	                match_writer
-    	                .write(prev_min.source, &prev_min.sa_value.to_le_bytes())
-	                    .unwrap();
-	            }
-                match_count.fetch_add(1, Ordering::SeqCst);
-            }
-            if !cur_min.prev_char_same(&prev_min) {
-	            match_writer
-	                .write(cur_min.source, &cur_min.sa_value.to_le_bytes())
-	                .unwrap();
-	        } else {
-        		println!("Longer thing");
-	        }
-
-            match_count.fetch_add(1, Ordering::SeqCst);
-            currently_in_a_run = true;
-        } else {
-            currently_in_a_run = false;
-        }
-        if let Some(node) = stream_iterators.get_mut(&cur_min.source).unwrap().next() {
-            pq.push(Reverse(node.unwrap()));
-        }
-        prev_min = cur_min;
-    }
-
-    match_writer.finish().unwrap();
-
-    println!(
-        "Finished PQ in {:?} secs | found {:?} matches | {:?}/{:?}",
-        start_main.elapsed().as_secs(),
-        match_count.into_inner(),
-        stream_runs,
-        total_steps
-    );
-    Ok(())
-}
-
 pub fn get_matches_serial(storage_dir: &PathBuf, match_length: usize) -> Result<(), Error> {
     /* Step 1:
     Load into memory:
@@ -456,56 +359,16 @@ pub fn get_matches_serial(storage_dir: &PathBuf, match_length: usize) -> Result<
     let start_main = Instant::now();
     let text_lookup = make_text_lookups(storage_dir).unwrap();
     let offset_lookup = make_offset_lookups(storage_dir).unwrap();
-    let total_counts: usize = text_lookup.iter().map(|v| v.len()).sum();
-    let mut table_streams = make_table_streams(storage_dir, &text_lookup, &offset_lookup).unwrap();
-    let pbar = build_pbar(total_counts, "Count.len");
-    let mut stream_iterators: HashMap<usize, TextIterator<File>> = HashMap::default();
+    let table_streams = make_table_streams(storage_dir, &text_lookup, &offset_lookup).unwrap();
 
-    table_streams.iter_mut().for_each(|s| {
-        stream_iterators.insert(s.source, s.text_iter(match_length));
-    });
-
-    /* Step 2: Initialize min-order data structure
-    	*/
-    let mut loser_tree = LoserTree::new(stream_iterators, None);
-    let match_writer = MatchWriter::new(&storage_dir.clone().join("matches")).unwrap();
-    let match_count = AtomicUsize::new(0);
-    let prev_min = loser_tree.pop().unwrap();
-    if prev_min == None {
-        return Ok(());
-    }
-
-    let mut prev_min = prev_min.unwrap();
-    let mut currently_in_a_run = false;
-    let mut pop_count = 0;
-    while !loser_tree.peek().is_none() {
-        pop_count += 1;
-        let cur_min = loser_tree.pop_check().unwrap().unwrap();
-        if cur_min == prev_min {
-            if !currently_in_a_run {
-                match_writer
-                    .write(prev_min.source, &prev_min.sa_value.to_le_bytes())
-                    .unwrap();
-                match_count.fetch_add(1, Ordering::SeqCst);
-            }
-            match_writer
-                .write(cur_min.source, &cur_min.sa_value.to_le_bytes())
-                .unwrap();
-            match_count.fetch_add(1, Ordering::SeqCst);
-            currently_in_a_run = true;
-        } else {
-            currently_in_a_run = false;
-        }
-        prev_min = cur_min;
-        pbar.inc(1);
-    }
+    let mut stream_map: HashMap<usize, SAStream<File>> = table_streams.into_iter().enumerate().map(|(i, stream)| (i, stream)).collect();
+    let match_writer = MatchWriter::new(&storage_dir.clone().join("matches")).unwrap();    
+    let match_count = get_matches_parallel_thread(&mut stream_map, &match_writer, match_length, true, 0).unwrap();
     match_writer.finish().unwrap();
     println!(
-        "Finished PQ in {:?} secs | found {:?} matches| {:?} /{:?} ",
+        "Finished PQ in {:?} secs | found {:?} matches",
         start_main.elapsed().as_secs(),
-        match_count.into_inner(),
-        loser_tree.shortcut_count,
-        pop_count
+        match_count,
     );
     Ok(())
 }
@@ -567,8 +430,6 @@ fn make_offset_lookups(storage_dir: &PathBuf) -> Result<Vec<Vec<u64>>, Error> {
 
     Ok(offset_lookup)
 }
-
-
 
 
 fn make_table_streams<'stream, 'a>(
@@ -645,9 +506,12 @@ pub fn get_matches_parallel(storage_dir: &PathBuf, match_length: usize) -> Resul
     let match_writer = MatchWriter::new(&storage_dir.clone().join("matches")).unwrap();
     // Finally we can do the parallel merge thing:
     println!("Starting parallel match-finding...");
+    let thread_pbar = build_pbar(thread_iters.len(), "Jobs");
+
     //pbar = build_pbar()
-    thread_iters.par_iter_mut().enumerate().for_each(|(i, streams)| {
-        get_matches_parallel_thread(streams, &match_writer, match_length, i==0 ).unwrap()
+    thread_iters.par_iter_mut().enumerate().for_each(|(part_num, streams)| {
+        get_matches_parallel_thread(streams, &match_writer, match_length, part_num==0, part_num).unwrap();
+        thread_pbar.inc(1);
     });
     match_writer.finish().unwrap();
 
@@ -868,60 +732,112 @@ fn sa_disk_bisect(
     Ok(left)
 }
 
-fn get_matches_parallel_thread<'a>(
-    streams: &'a mut HashMap<usize, SAStream<'a, FileRange>>,
+fn get_matches_parallel_thread<'a, R: Read + ByteSize>(
+    streams: &'a mut HashMap<usize, SAStream<'a, R>>,
     match_writer: &MatchWriter,
     match_length: usize,
-    use_pbar: bool
-) -> Result<(), Error> {
+    use_pbar: bool,
+    part_num: usize,
+) -> Result<usize, Error> {
 
+    // Build pbar if requested
     let pbar_opt = if use_pbar {
     	let total_size: usize = streams.iter().map(|(_k,v)| v.byte_size as usize).sum::<usize>();
-    	let pbar = build_pbar(total_size, "Thread bytes");
+    	let pbar = build_pbar(total_size / 8, "Thread bytes");
     	Some(pbar)
     } else {
     	None
     };
 
-    let stream_iterators: HashMap<usize, TextIterator<FileRange>> = streams
+    // Convert streams to iterators
+    let stream_iterators: HashMap<usize, TextIterator<R>> = streams
         .iter_mut()
         .map(|(k, v)| (*k, v.text_iter(match_length)))
         .collect();
 
+    // Init LoserTree
+    let mut match_count = 0;
+    let part_num64 = part_num as u64;
     let mut loser_tree = LoserTree::new(stream_iterators, pbar_opt);
-    let match_count = AtomicUsize::new(0);
     let prev_min = loser_tree.pop().unwrap();
     if prev_min == None {
-        return Ok(());
+        return Ok(match_count);
     }
     let mut prev_min = prev_min.unwrap();
+    let mut prev_lcp: Option<u64> = None;
     let mut currently_in_a_run = false;
+
+    /* Loop through LoserTree 
+    Steps: 
+        1. Get the top value and if it shares match_length bytes w/ the last popped el, proceed to step 2. O/w loop.
+        2a. If "not in a run", then the stashed "prev" needs to be written with all data and _current_ LCP 
+        2b. IF "yes in a run", the check if _current_ LCP is > the prev LCP
+    */
     while !loser_tree.peek().is_none() {
         let cur_min = loser_tree.pop_check().unwrap().unwrap();
-        if cur_min == prev_min {
-            if !currently_in_a_run {
-            	if !cur_min.prev_char_same(&prev_min) {
-	                match_writer
-	                    .write(prev_min.source, &prev_min.sa_value.to_le_bytes())
-	                    .unwrap();
-	            }
-                match_count.fetch_add(1, Ordering::SeqCst);
+
+
+        if cur_min.cmp_eq(&prev_min) {// If top value shares match_length bytes w/ previously popped el...
+            let cur_lcp = cur_min.lcp(&prev_min, match_length);
+            if !cur_min.prev_char_same(&prev_min) { // If we would fully subsume this by some other thing
+                let lcp_to_write = if let Some(prev_lcp_val) = prev_lcp {
+                    prev_lcp_val.max(cur_lcp)
+                } else {
+                    cur_lcp
+                };
+
+                let prev_write_element = MatchWriterElement {
+                    source: prev_min.source,
+                    part_num: part_num64,
+                    sa_idx: prev_min.sa_idx,
+                    sa_value: prev_min.sa_value,
+                    lcp: lcp_to_write,
+                    first_run_el: !currently_in_a_run
+                };
+                match_writer.write_element(prev_write_element).unwrap();
+                match_count += 1;
             }
-            if !cur_min.prev_char_same(&prev_min) {
-	            match_writer
-	                .write(cur_min.source, &cur_min.sa_value.to_le_bytes())
-	                .unwrap();            	
-	            }
-            match_count.fetch_add(1, Ordering::SeqCst);
+            prev_lcp = Some(cur_lcp);
             currently_in_a_run = true;
         } else {
-            currently_in_a_run = false;
+            if currently_in_a_run {// If I'm ending a run, write the previous thing in 
+                let prev_write_element = MatchWriterElement {
+                    source: prev_min.source,
+                    part_num: part_num64,
+                    sa_idx: prev_min.sa_idx,
+                    sa_value: prev_min.sa_value,
+                    lcp: prev_lcp.unwrap(),
+                    first_run_el: false
+                };                
+                match_writer.write_element(prev_write_element).unwrap();
+                match_count += 1;
+            }
+            prev_lcp = None;
+            currently_in_a_run = false;            
         }
         prev_min = cur_min;
     }
 
-    Ok(())
+    if currently_in_a_run {
+        let prev_write_element = MatchWriterElement {
+            source: prev_min.source,
+            part_num: part_num64,
+            sa_idx: prev_min.sa_idx,
+            sa_value: prev_min.sa_value,
+            lcp: prev_lcp.unwrap(),
+            first_run_el: false
+        };                
+        match_writer.write_element(prev_write_element).unwrap();        
+        match_count += 1;
+
+    }
+
+
+    Ok(match_count)
 }
+
+
+
 
 /*=====================================================================
 =                            ALTERNATIVE FLOW                         =
@@ -958,7 +874,7 @@ pub fn alternative_merge(
     let mut currently_in_a_run = false;
     for el in text_iterator {
         let cur_node = el.unwrap();
-        if cur_node == prev_min {
+        if cur_node.cmp_eq(&prev_min) {
             if currently_in_a_run {
                 matches.push(prev_min.sa_value);
             }
@@ -982,7 +898,7 @@ pub fn alternative_merge(
 =                           MERGE MATCHES                             =
 =====================================================================*/
 
-pub fn merge_matches(storage_dir: &PathBuf, match_length: usize) -> Result<(), Error> {
+pub fn merge_matches(storage_dir: &PathBuf) -> Result<(), Error> {
     let start_main = Instant::now();
     println!("Starting merging of matches");
 
@@ -1021,7 +937,6 @@ pub fn merge_matches(storage_dir: &PathBuf, match_length: usize) -> Result<(), E
             match_path,
             &offset_path,
             &merged_match_dir,
-            match_length,
             pbar_counter.fetch_add(1, Ordering::SeqCst) == 0,
         )
         .unwrap();
@@ -1038,10 +953,12 @@ pub fn merge_match_path(
     match_path: PathBuf,
     offset_path: &PathBuf,
     merged_match_dir: &PathBuf,
-    match_length: usize,
     pbar_flag: bool,
 ) -> Result<(), Error> {
-    let mut match_idxs = read_u64_vec(&match_path).unwrap();
+    let part_num = get_part_num(&match_path).unwrap();
+    let match_contents = read_pathbuf_to_mem(&match_path).unwrap().into_inner().into_inner();
+    let elements = match_contents.chunks(MatchWriterElement::MATCH_EL_SIZE).map(|chunk| MatchWriterElement::from_bytes(part_num, chunk)).collect::<Vec<MatchWriterElement>>();
+
     let offset_trips = read_u64_vec(&offset_path).unwrap();
     let offset_trips: Vec<(u64, u64, u64)> = offset_trips
         .chunks_exact(3)
@@ -1049,63 +966,126 @@ pub fn merge_match_path(
         .collect(); // (path_id, line_num, idx-ceiling)
 
     let pbar_opt = if pbar_flag {
-        Some(build_pbar(match_idxs.len(), "Matches"))
+        Some(build_pbar(elements.len() * 2, "Matches"))
     } else {
         None
     };
-    match_idxs.sort();
-    if match_idxs.len() == 0 {
-        return Ok(());
-    }
-    let match_length = match_length as u64;
 
-    // match_intervals should be packing of (path_id, line_num, start_byte, end_byte) [within the doc!]
-    // (but let's just get the interval in the concatenated text file first)
-    let mut match_intervals: Vec<u64> = Vec::new();
-    let mut cur_start = match_idxs[0];
-    let mut cur_end = cur_start + match_length;
-    let mut last_branch: bool = false;
-    for idx in match_idxs.into_iter().skip(1) {
-        if idx <= cur_end {
-            cur_end = idx + match_length;
-            last_branch = false
-        } else {
-            let offset_index = offset_trips.partition_point(|&(_, _, third)| third < cur_end);
-            let offset_trip = offset_trips.get(offset_index).unwrap();
-            let prev_offset_start = offset_trips.get(offset_index - 1).unwrap().2;
-            match_intervals.extend(vec![
-                offset_trip.0,
-                offset_trip.1,
-                cur_start - prev_offset_start,
-                cur_end - prev_offset_start,
-            ]);
-            cur_start = idx;
-            cur_end = cur_start + match_length;
-            last_branch = false
-        }
+    let mut grouped_matches: HashMap<(usize, usize), Vec<MatchWriterElement>> = HashMap::default(); // maps (path_id, line_num) to modified matchWriter els
+    elements.into_iter().for_each(|mut el| {
+        let offset_index = offset_trips.partition_point(|&(_, _, document_end)| document_end < el.sa_value);
+        let offset_trip = offset_trips.get(offset_index).unwrap();
+        let prev_offset_start = offset_trips.get(offset_index - 1).unwrap().2;
+        el.sa_value -= prev_offset_start;
+        let path_id = offset_trip.0;
+        let line_num = offset_trip.1;        
+        grouped_matches.entry(
+            (path_id.try_into().unwrap(), line_num.try_into().unwrap())
+        ).or_default().push(el);
+
         if let Some(ref pbar) = pbar_opt {
             pbar.inc(1);
         }
-    }
-    if !last_branch {
-        let offset_index = offset_trips.partition_point(|&(_, _, third)| third < cur_end);
-        let offset_trip = offset_trips.get(offset_index).unwrap();
-        let prev_offset_start = offset_trips.get(offset_index - 1).unwrap().2;
-        match_intervals.extend(vec![
-            offset_trip.0,
-            offset_trip.1,
-            cur_start - prev_offset_start,
-            cur_end - prev_offset_start,
-        ]);
-    }
+    });
 
-    let match_interval_bytes: &[u8] = bytemuck::cast_slice(&match_intervals);
+    
+
+    let mut output_bytes: Vec<u8> = Vec::new();
+
+    grouped_matches.iter_mut().for_each(|(k, v)| { 
+        let vlen = v.len();
+        v.sort_by(|a, b| {a.sa_value.cmp(&b.sa_value)});
+        let (safe_intervals, to_remove_intervals): (Vec<_>, Vec<_>) = v.into_iter().partition(|el| el.first_run_el);
+
+
+        let remove_merged = merge_intervals(to_remove_intervals);
+        let safe_merged = merge_intervals(safe_intervals);
+
+        // and then remove any safe intervals        
+        let output_intervals = subtract_intervals(remove_merged, safe_merged);        
+
+        // And write into outputs 
+        let path_id_bytes = k.0.to_le_bytes();
+        let line_num_bytes = k.1.to_le_bytes();
+        for (start, end) in output_intervals {
+            output_bytes.extend(path_id_bytes);
+            output_bytes.extend(line_num_bytes);
+            output_bytes.extend(start.to_le_bytes());
+            output_bytes.extend(end.to_le_bytes());
+        }
+
+        if let Some(ref pbar) = pbar_opt {
+            pbar.inc(vlen.try_into().unwrap());
+        }        
+    });
+
+
     let file_stem = match_path.file_stem().unwrap().to_str().unwrap();
     let output_filename = merged_match_dir
         .clone()
         .join(format!("merged_{}.bin", file_stem));
-    write_mem_to_pathbuf(match_interval_bytes, &output_filename)
+    write_mem_to_pathbuf(&output_bytes, &output_filename)    
 }
+
+pub fn merge_intervals(els: Vec<&mut MatchWriterElement>) -> Vec<(u64, u64)> {
+    if els.is_empty() {
+        return Vec::new()
+    }
+    // Assume els is sorted to begin with
+    let mut merged: Vec<(u64, u64)> = Vec::new();
+    let first = els.first().unwrap();
+    let mut start = first.sa_value;
+    let mut cur_end = start + first.lcp;
+
+    els.into_iter().skip(1).for_each(|el| {
+        if el.sa_value > cur_end {
+            merged.push((start, cur_end));
+            start = el.sa_value;
+        } else {}
+        cur_end = el.sa_value + el.lcp
+    });
+    merged.push((start, cur_end));
+    merged
+}
+
+fn subtract_intervals(vec_a: Vec<(u64, u64)>, vec_b: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
+    let mut result = Vec::new();
+    let mut b_idx = 0;    
+    for (a_start, a_end) in vec_a {
+        let mut current_start = a_start;        
+        // Skip intervals in vec_b that end before current interval starts
+        while b_idx < vec_b.len() && vec_b[b_idx].1 <= current_start {
+            b_idx += 1;
+        }        
+        // Process all intervals in vec_b that might overlap with current interval
+        let mut temp_b_idx = b_idx;
+        while temp_b_idx < vec_b.len() && vec_b[temp_b_idx].0 < a_end {
+            let (b_start, b_end) = vec_b[temp_b_idx];            
+            // If there's a gap before this b interval, add it to result
+            if current_start < b_start.min(a_end) {
+                result.push((current_start, b_start.min(a_end)));
+            }            
+            // Move current_start past this b interval
+            current_start = b_end.max(current_start);            
+            // If we've consumed the entire a interval, break
+            if current_start >= a_end {
+                break;
+            }            
+            temp_b_idx += 1;
+        }
+        
+        // Add any remaining part of the a interval
+        if current_start < a_end {
+            result.push((current_start, a_end));
+        }
+    }
+    
+    result
+}
+
+
+
+
 
 /*======================================================================
 =                            ANNOTATE FILES                            =
@@ -1116,9 +1096,12 @@ pub fn sa_annotate_files(
     storage_dir: &PathBuf,
     output_dir: &PathBuf,
     annotate_key: &String,
+    text_key: Option<String>,
 ) -> Result<(), Error> {
     let start_main = Instant::now();
     println!("Starting annotation...");
+    let text_key = text_key.unwrap_or(String::from("text"));
+
     let file_map_loc = storage_dir.clone().join("file_map.json.gz");
     let file_map = FileMap::load(&file_map_loc).unwrap();
 
@@ -1158,7 +1141,7 @@ pub fn sa_annotate_files(
         .par_iter()
         .filter(|(p, _idx)| input_dir.clone().join(p).exists())
         .collect();
-    let pbar = build_pbar(extant_idxs.len(), "Pahts");
+    let pbar = build_pbar(extant_idxs.len(), "Paths");
 
     let anno_docs = AtomicUsize::new(0);
     let anno_bytes = AtomicUsize::new(0);
@@ -1167,7 +1150,7 @@ pub fn sa_annotate_files(
         let anno_group = anno_groups.entry(*idx).or_default();
         let input_path = input_dir.clone().join(&p);
         let output_path = get_output_filename(&input_path, input_dir, output_dir).unwrap();
-        let (p_anno_docs, p_anno_bytes) = sa_annotate_path(input_path, &anno_group, &output_path, annotate_key).unwrap();
+        let (p_anno_docs, p_anno_bytes) = sa_annotate_path(input_path, &anno_group, &output_path, annotate_key, &text_key).unwrap();
         anno_docs.fetch_add(p_anno_docs, Ordering::SeqCst);
         anno_bytes.fetch_add(p_anno_bytes, Ordering::SeqCst);
         pbar.inc(1);
@@ -1186,19 +1169,33 @@ fn sa_annotate_path(
     anno_group: &DashMap<usize, Vec<(u64, u64)>>,
     output_path: &PathBuf,
     annotate_key: &String,
+    text_key: &String,
 ) -> Result<(usize, usize), Error> {
     let contents = read_pathbuf_to_mem(&input_path).unwrap();
     let mut output_contents: Vec<u8> = Vec::new();
     let mut p_anno_docs = 0;
     let mut p_anno_bytes = 0;
-    for (line_num, line) in contents.lines().enumerate() {
+    for (line_num, line) in contents.lines().enumerate() {        
         let line = line.unwrap();
+
         let anno_val = anno_group.entry(line_num).or_default();
         if anno_val.len() == 0 {
             output_contents.extend(line.as_bytes());
-        } else {
+        } else {                    
         	p_anno_docs += 1;
             let mut line_json: Value = serde_json::from_str(&line).unwrap();
+            let text_len = json_get(&line_json, text_key).unwrap().as_str().unwrap().len() as u64;
+
+            let anno_val: Vec<(u64, u64)> = anno_val.iter().filter_map(|(l, r)| {
+                let l2 = l.min(&text_len);
+                let r2 = r.min(&text_len);
+                if l2 == r2 {
+                    None
+                } else {
+                    Some((*l2, *r2))
+                }
+            }).collect();
+
             p_anno_bytes += anno_val.iter().map(|(l, r)| (r - l) as usize).sum::<usize>();
             let anno_val: Value = json!(*anno_val);
             json_set(&mut line_json, annotate_key, anno_val).unwrap();

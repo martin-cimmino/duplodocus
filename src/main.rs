@@ -746,9 +746,6 @@ enum Commands {
     SaMergeMatches {
         #[arg(required = true, long)]
         storage_dir: PathBuf,
-
-        #[arg(long, default_value_t = 500)]
-        match_length: usize,
     },
 
     #[clap(arg_required_else_help = true)]
@@ -764,6 +761,9 @@ enum Commands {
 
         #[arg(required = true, long)]
         annotate_key: String,
+
+        #[arg(long)]
+        text_key: Option<String>,
     },
 
     #[clap(arg_required_else_help = true)]
@@ -1012,16 +1012,16 @@ fn main() {
         } => get_matches_parallel(storage_dir, *match_length),        
 
         Commands::SaMergeMatches {
-            storage_dir,
-            match_length,
-        } => merge_matches(storage_dir, *match_length),
+            storage_dir,            
+        } => merge_matches(storage_dir),
 
         Commands::SaAnnotate {
             input_dir,
             storage_dir,
             output_dir,
             annotate_key,
-        } => sa_annotate_files(input_dir, storage_dir, output_dir, annotate_key),
+            text_key,
+        } => sa_annotate_files(input_dir, storage_dir, output_dir, annotate_key, text_key.clone()),
 
         Commands::SaAlt {
             text,
