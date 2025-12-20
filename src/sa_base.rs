@@ -801,7 +801,7 @@ fn get_matches_parallel_thread<'a, R: Read + ByteSize>(
             prev_lcp = Some(cur_lcp);
             currently_in_a_run = true;
         } else {
-            if currently_in_a_run && prev_char_same {// If I'm ending a run, write the previous thing in 
+            if currently_in_a_run && !prev_char_same {// If I'm ending a run, write the previous thing in 
                 let prev_write_element = MatchWriterElement {
                     source: prev_min.source,
                     part_num: part_num64,
@@ -820,7 +820,7 @@ fn get_matches_parallel_thread<'a, R: Read + ByteSize>(
         prev_min = cur_min;
     }
 
-    if currently_in_a_run && prev_char_same {
+    if currently_in_a_run && !prev_char_same {
         let prev_write_element = MatchWriterElement {
             source: prev_min.source,
             part_num: part_num64,
