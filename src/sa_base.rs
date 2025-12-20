@@ -766,7 +766,7 @@ fn get_matches_parallel_thread<'a, R: Read + ByteSize>(
     let mut prev_min = prev_min.unwrap();
     let mut prev_lcp: Option<u64> = None;
     let mut currently_in_a_run = false;
-
+    let mut prev_char_same = false;
     /* Loop through LoserTree 
     Steps: 
         1. Get the top value and if it shares match_length bytes w/ the last popped el, proceed to step 2. O/w loop.
@@ -779,7 +779,8 @@ fn get_matches_parallel_thread<'a, R: Read + ByteSize>(
 
         if cur_min.cmp_eq(&prev_min) {// If top value shares match_length bytes w/ previously popped el...
             let cur_lcp = cur_min.lcp(&prev_min, match_length);
-            if !cur_min.prev_char_same(&prev_min) { // If we would fully subsume this by some other thing
+            let prev_char_same = cur_min.prev_char_same(&prev_min);
+            if !prev_char_same { // If we would fully subsume this by some other thing
                 let lcp_to_write = if let Some(prev_lcp_val) = prev_lcp {
                     prev_lcp_val.max(cur_lcp)
                 } else {
@@ -800,7 +801,7 @@ fn get_matches_parallel_thread<'a, R: Read + ByteSize>(
             prev_lcp = Some(cur_lcp);
             currently_in_a_run = true;
         } else {
-            if currently_in_a_run {// If I'm ending a run, write the previous thing in 
+            if currently_in_a_run && prev_char_same {// If I'm ending a run, write the previous thing in 
                 let prev_write_element = MatchWriterElement {
                     source: prev_min.source,
                     part_num: part_num64,
@@ -814,11 +815,12 @@ fn get_matches_parallel_thread<'a, R: Read + ByteSize>(
             }
             prev_lcp = None;
             currently_in_a_run = false;            
+            prev_char_same = false;
         }
         prev_min = cur_min;
     }
 
-    if currently_in_a_run {
+    if currently_in_a_run && prev_char_same {
         let prev_write_element = MatchWriterElement {
             source: prev_min.source,
             part_num: part_num64,
