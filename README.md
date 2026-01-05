@@ -7,6 +7,7 @@ High-performance exact and fuzzy (MinHash) document deduplication tool, natively
 
 ## Table of Contents
 - [Overview](#overview)
+- [Theory/Primer](#theory)
 - [Installation](#installation)
 - [Quick Start](#quick-start)
 - [Deduplication Methods](#deduplication-methods)
@@ -32,6 +33,8 @@ This tool provides four deduplication strategies optimized for different dataset
 - **Distributed**: Disk-based methods support parallel processing across multiple machines
 - **Flexible**: Annotate duplicates or remove them entirely
 
+## Theory
+Some notes on the theory behind this tooling and some details about the internals are contained in the [primer](primer.md).
 ## Installation
 
 ### Prerequisites
