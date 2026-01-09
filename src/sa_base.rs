@@ -969,9 +969,7 @@ pub fn merge_match_path(
 
     let mut grouped_matches: HashMap<(usize, usize), Vec<MatchWriterElement>> = HashMap::default(); // maps (path_id, line_num) to modified matchWriter els
     elements.into_iter().for_each(|mut el| {
-        println!("OFFSETS TRIPS {:?}", offset_trips);
         let offset_index = offset_trips.partition_point(|&(_, _, document_end)| document_end <= el.sa_value);
-        println!("OFFSETS IDX {:?} | SA VAL {:?}", offset_index, el.sa_value);
 
         let offset_trip = offset_trips.get(offset_index).unwrap();
         let prev_offset_start = offset_trips.get(offset_index - 1).unwrap().2;
