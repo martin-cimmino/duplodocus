@@ -225,7 +225,7 @@ impl<'a, R: Read + ByteSize> Iterator for SAStream<'a, R> {
 }
 
 pub struct TextIterator<'stream, 'a, R: Read> where R: ByteSize, R: ByteSize {
-    stream: &'stream mut SAStream<'a, R>,
+    pub stream: &'stream mut SAStream<'a, R>,
     pub next_call_counter: u64,
     min_len: usize,
 }
@@ -239,8 +239,8 @@ impl<'stream, 'a, R: Read + ByteSize> Iterator for TextIterator<'stream, 'a, R> 
             self.next_call_counter += 1;
             let next_idx_opt = self.stream.next();
             if let Some(next_idx) = next_idx_opt {
-                let next_idx = next_idx.unwrap();
-                if next_idx as usize + self.min_len >= self.stream.text.len() {
+                let next_idx = next_idx.unwrap();            
+                if next_idx as usize + self.min_len > self.stream.text.len() {
                     continue;
                 }
                 let next_eos = self.next_eos(next_idx as usize).unwrap() as usize;
@@ -285,7 +285,7 @@ impl<'stream, 'a, R: Read + ByteSize> TextIterator<'stream, 'a, R> {
         while left < right {
             let mid = left + (right - left) / 2;
             
-            if offset[mid * 3 + 2] < idx as u64 {
+            if offset[mid * 3 + 2] <= idx as u64 {
                 // Element at mid is too small, search right half
                 left = mid + 1;
             } else {
@@ -304,7 +304,7 @@ impl<'stream, 'a, R: Read + ByteSize> TextIterator<'stream, 'a, R> {
             let next_idx_opt = self.stream.next();
             if let Some(next_idx) = next_idx_opt {
                 let next_idx = next_idx.unwrap();
-                if next_idx as usize + self.min_len >= self.stream.text.len() { // overruns the endpoint of the stream, skip
+                if next_idx as usize + self.min_len > self.stream.text.len() { // overruns the endpoint of the stream, skip
                     continue;
                 }
                 let next_eos = self.next_eos(next_idx as usize).unwrap() as usize;                
@@ -318,7 +318,7 @@ impl<'stream, 'a, R: Read + ByteSize> TextIterator<'stream, 'a, R> {
                     let prev_char = (&self.stream.text.get(next_idx as usize - 1)).clone().unwrap();
                     Some(*prev_char)
                 } else {
-                    None
+                    None 
                 };               
 
                 return (loop_counter, Some(Ok(TreeNode {

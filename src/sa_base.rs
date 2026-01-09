@@ -176,7 +176,7 @@ pub fn make_sa_tables(
     println!("CHUNK BYTE LIMIT {:?} | CHUNK SIZES {:?}", chunk_text_byte_size, chunk_sizes); 
     let total_bytes = AtomicUsize::new(0);
 
-    let total_pbar = build_pbar(owned_chunks.len() * 4, "Total steps");
+    let total_pbar = build_pbar(owned_chunks.len() * 3, "Total steps");
     owned_chunks.into_par_iter().for_each(|(table_idx, chunk)| {
         let allocate_size = chunk
             .iter()
@@ -195,7 +195,6 @@ pub fn make_sa_tables(
             // Offsets are trips of (path_id, line_num, current_offset)
         });
         assert_eq!(document_offsets.len() % 3, 0);
-
         total_bytes.fetch_add(allocate_size, Ordering::SeqCst);
         total_pbar.inc(1);
         // And save concatenated text just for safekeeping
@@ -306,11 +305,6 @@ fn chunk_data_for_sa(
         chunks[i % thread_count].push(item);
     }
     
-    // Sort each bucket in parallel
-    chunks.par_iter_mut().for_each(|bucket| {
-        bucket.par_sort_unstable_by_key(|(r, _)| *r);
-    });
-
     // Step 3: split each bucket into memory-bounded chunks
     chunks.into_par_iter().for_each(|chunk| {
         let mut current_part = chunk_counter.fetch_add(1, Ordering::SeqCst);
@@ -361,7 +355,7 @@ pub fn get_matches_serial(storage_dir: &PathBuf, match_length: usize) -> Result<
     let offset_lookup = make_offset_lookups(storage_dir).unwrap();
     let table_streams = make_table_streams(storage_dir, &text_lookup, &offset_lookup).unwrap();
 
-    let mut stream_map: HashMap<usize, SAStream<File>> = table_streams.into_iter().enumerate().map(|(i, stream)| (i, stream)).collect();
+    let mut stream_map: HashMap<usize, SAStream<File>> = table_streams.into_iter().enumerate().map(|(i, stream)| (i, stream)).collect();    
     let match_writer = MatchWriter::new(&storage_dir.clone().join("matches")).unwrap();    
     let match_count = get_matches_parallel_thread(&mut stream_map, &match_writer, match_length, true, 0).unwrap();
     match_writer.finish().unwrap();
@@ -755,6 +749,7 @@ fn get_matches_parallel_thread<'a, R: Read + ByteSize>(
         .map(|(k, v)| (*k, v.text_iter(match_length)))
         .collect();
 
+
     // Init LoserTree
     let mut match_count = 0;
     let part_num64 = part_num as u64;
@@ -775,11 +770,9 @@ fn get_matches_parallel_thread<'a, R: Read + ByteSize>(
     */
     while !loser_tree.peek().is_none() {
         let cur_min = loser_tree.pop_check().unwrap().unwrap();
-
-
         if cur_min.cmp_eq(&prev_min) {// If top value shares match_length bytes w/ previously popped el...
             let cur_lcp = cur_min.lcp(&prev_min, match_length);
-            let prev_char_same = cur_min.prev_char_same(&prev_min);
+            prev_char_same = cur_min.prev_char_same(&prev_min);
             if !prev_char_same { // If we would fully subsume this by some other thing
                 let lcp_to_write = if let Some(prev_lcp_val) = prev_lcp {
                     prev_lcp_val.max(cur_lcp)
@@ -798,6 +791,7 @@ fn get_matches_parallel_thread<'a, R: Read + ByteSize>(
                 match_writer.write_element(prev_write_element).unwrap();
                 match_count += 1;
             }
+
             prev_lcp = Some(cur_lcp);
             currently_in_a_run = true;
         } else {
@@ -815,7 +809,7 @@ fn get_matches_parallel_thread<'a, R: Read + ByteSize>(
             }
             prev_lcp = None;
             currently_in_a_run = false;            
-            prev_char_same = false;
+            //prev_char_same = false;
         }
         prev_min = cur_min;
     }
@@ -975,7 +969,10 @@ pub fn merge_match_path(
 
     let mut grouped_matches: HashMap<(usize, usize), Vec<MatchWriterElement>> = HashMap::default(); // maps (path_id, line_num) to modified matchWriter els
     elements.into_iter().for_each(|mut el| {
-        let offset_index = offset_trips.partition_point(|&(_, _, document_end)| document_end < el.sa_value);
+        println!("OFFSETS TRIPS {:?}", offset_trips);
+        let offset_index = offset_trips.partition_point(|&(_, _, document_end)| document_end <= el.sa_value);
+        println!("OFFSETS IDX {:?} | SA VAL {:?}", offset_index, el.sa_value);
+
         let offset_trip = offset_trips.get(offset_index).unwrap();
         let prev_offset_start = offset_trips.get(offset_index - 1).unwrap().2;
         el.sa_value -= prev_offset_start;
