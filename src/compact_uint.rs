@@ -1,4 +1,5 @@
 use std::fmt;
+use bytemuck::{Pod, Zeroable};
 
 /// A trait for compact unsigned integer types that can be used as suffix array indices.
 /// 
@@ -24,7 +25,7 @@ pub trait CompactUint:
     
     /// Return the maximum value as Self.
     fn max_I() -> Self;
-    
+
     /// The size of this type in bytes.
     const BYTE_SIZE: usize;
 }
@@ -98,8 +99,11 @@ impl CompactUint for u64 {
 /// Uses 5 bytes of storage compared to 8 bytes for u64, providing a 37.5%
 /// memory reduction for suffix arrays on large datasets.
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd)]
-#[repr(align(8))] // Align to 8 bytes to help with cache line efficiency
+#[repr(C)] // Align to 8 bytes to help with cache line efficiency
 pub struct U40([u8; 5]);
+
+unsafe impl Zeroable for U40 {}
+unsafe impl Pod for U40 {}
 
 impl U40 {
     /// Maximum value that can be stored in a U40 (2^40 - 1)

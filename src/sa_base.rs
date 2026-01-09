@@ -215,9 +215,8 @@ pub fn make_sa_tables(
         write_mem_to_pathbuf(offset_vec, &output_offset_filename).unwrap();
 
         // And then make the SA table too
-        let table: SuffixTableGeneric<'_, '_, > = SuffixTableGeneric::new(buf).unwrap();
+        let table: SuffixTableGeneric<'_, '_, U40> = SuffixTableGeneric::new(buf).unwrap();
         total_pbar.inc(1);
-
         let table_to_write: &[u8] = bytemuck::cast_slice(table.table());
         let output_table_filename = output_dir
             .clone()
