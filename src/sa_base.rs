@@ -18,8 +18,8 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
-use crate::table_old::SuffixTable;
-use crate::table_generic::SuffixTableGeneric;
+//use crate::table_old::SuffixTable;
+use crate::table_generic::DynamicSuffixTable;
 use anyhow::{Error, Result};
 use gjson;
 use mj_io::{
@@ -32,7 +32,7 @@ use std::path::PathBuf;
 use std::cmp::Ordering as StdOrdering;
 use std::collections::BinaryHeap;
 
-use crate::sa_utils::{FileRange, SAStream, TextIterator, MatchWriter, MatchWriterElement, TreeNode, LoserTree, read_u64_vec, sa_safety_check, calculate_bytes_per_chunk, ByteSize};
+use crate::sa_utils::{FileRange, SAStream, TextIterator, MatchWriter, MatchWriterElement, TreeNode, LoserTree, read_u64_vec, sa_safety_check, calculate_bytes_per_chunk, ByteSize, get_byte_size};
 use crate::sa_config::{SAConfigOverrides, SAConfig};
 use crate::compact_uint::U40;
 /*
@@ -215,7 +215,7 @@ pub fn make_sa_tables(
         write_mem_to_pathbuf(offset_vec, &output_offset_filename).unwrap();
 
         // And then make the SA table too
-        let table: SuffixTableGeneric<'_, '_, U40> = SuffixTableGeneric::new(buf).unwrap();
+        let table = DynamicSuffixTable::new(&buf, buf.len() as u64).unwrap();
         total_pbar.inc(1);
         let table_to_write: &[u8] = bytemuck::cast_slice(table.table());
         let output_table_filename = output_dir
@@ -442,6 +442,7 @@ fn make_table_streams<'stream, 'a>(
         .into_par_iter()
         .map(|p| {
             let table_idx = get_part_num(&p).unwrap();
+            let sa_element_size = get_byte_size(text_lookup[table_idx].len());
             let open_file = File::open(&p).unwrap();
             let stream = SAStream::new(
                 open_file,
@@ -449,6 +450,7 @@ fn make_table_streams<'stream, 'a>(
                 offset_lookup[table_idx].as_slice(),
                 table_idx,
                 16384,
+                sa_element_size,
             )
             .unwrap();
             stream
@@ -532,9 +534,9 @@ fn get_reference_suffices(
     let mut reference_table_file: File = File::open(&reference_table_path).unwrap();
     let part_num = get_part_num(&reference_table_path).unwrap();
     let reference_text = text_lookup[part_num].as_slice();
-
+    let sa_element_size = get_byte_size(reference_text.len());
     // And get the boundary indices
-    let suffix_len = reference_table_file.metadata().unwrap().len() / 8;
+    let suffix_len = reference_table_file.metadata().unwrap().len() / sa_element_size as u64;
     assert!(thread_count > 1);
     assert!(suffix_len > thread_count.try_into().unwrap());
     let el_idxs: Vec<usize> = (1..thread_count)
@@ -545,10 +547,10 @@ fn get_reference_suffices(
     let mut reference_suffices: Vec<Vec<u8>> = Vec::new();
     el_idxs.into_iter().for_each(|i| {
         reference_table_file
-            .seek(SeekFrom::Start((8 * i).try_into().unwrap()))
+            .seek(SeekFrom::Start((sa_element_size * i).try_into().unwrap()))
             .unwrap();
         let mut buffer = [0u8; 8];
-        reference_table_file.read_exact(&mut buffer).unwrap();
+        reference_table_file.read_exact(&mut buffer[..sa_element_size]).unwrap();
         let boundary_start = u64::from_le_bytes(buffer);
         let boundary_end = std::cmp::min(
             reference_text.len(),
@@ -602,7 +604,8 @@ fn get_substreams_from_boundaries<'a>(
     match_length: usize,
 ) -> Result<Vec<SAStream<'a, FileRange>>, Error> {
     let mut table_file = File::open(table_path).unwrap();
-    let sa_len = table_file.metadata().unwrap().len() / 8;
+    let sa_element_size = get_byte_size(text.len());
+    let sa_len = table_file.metadata().unwrap().len() / sa_element_size as u64;
 
     let mut start_end_idxs: Vec<(usize, usize)> = Vec::new();
     // 0'th element
@@ -664,11 +667,11 @@ fn get_substreams_from_boundaries<'a>(
             let new_file = File::open(table_path).unwrap();
             let file_range = FileRange::new(
                 new_file,
-                (l * 8).try_into().unwrap(),
-                (r * 8).try_into().unwrap(),
+                (l * sa_element_size).try_into().unwrap(),
+                (r * sa_element_size).try_into().unwrap(),
             )
             .unwrap();
-            let sas = SAStream::new(file_range, text_slice, offset_slice, part_num, 16384).unwrap();
+            let sas = SAStream::new(file_range, text_slice, offset_slice, part_num, 16384, sa_element_size).unwrap();
             sas
         })
         .collect();
@@ -684,7 +687,8 @@ fn sa_disk_bisect(
     find_right: bool, // true for bisect_right, false for bisect_left
 ) -> Result<usize, Error> {
     // Finds the index in the SA (in terms of SA ELEMENTS, not BYTES) such that everything to the left (idx <) is strictly less than boundary_str
-    let sa_len = (table_file.metadata().unwrap().len() / 8) as usize;
+    let sa_element_size = get_byte_size(text.len());
+    let sa_len = (table_file.metadata().unwrap().len() / sa_element_size as u64) as usize;
 
     let mut left = 0;
     let mut right = sa_len;
@@ -692,8 +696,8 @@ fn sa_disk_bisect(
     while left < right {
         let mid = left + (right - left) / 2;
         let mut buffer = [0u8; 8];
-        table_file.seek(SeekFrom::Start((mid * 8) as u64))?;
-        table_file.read_exact(&mut buffer)?;
+        table_file.seek(SeekFrom::Start((mid * sa_element_size) as u64))?;
+        table_file.read_exact(&mut buffer[..sa_element_size])?;
         let t_start = u64::from_le_bytes(buffer) as usize;
 
         let t_end = std::cmp::min(text.len(), t_start + match_length);
@@ -736,8 +740,8 @@ fn get_matches_parallel_thread<'a, R: Read + ByteSize>(
 
     // Build pbar if requested
     let pbar_opt = if use_pbar {
-    	let total_size: usize = streams.iter().map(|(_k,v)| v.byte_size as usize).sum::<usize>();
-    	let pbar = build_pbar(total_size / 8, "Thread bytes");
+    	let total_size: usize = streams.iter().map(|(_k,v)| v.byte_size as usize / v.element_size).sum::<usize>();
+    	let pbar = build_pbar(total_size, "Thread bytes");
     	Some(pbar)
     } else {
     	None
@@ -852,6 +856,7 @@ pub fn alternative_merge(
         .unwrap()
         .into_inner()
         .into_inner();
+    let sa_element_size = get_byte_size(text.len());
     let text_slice: &[u8] = text.as_slice();
 
     let offset = read_u64_vec(offset_loc).unwrap();   
@@ -860,7 +865,7 @@ pub fn alternative_merge(
     //let table_len = sa_table.len();
     let mut matches: Vec<u64> = Vec::new();
     let open_sa = File::open(sa_table_loc).unwrap();
-    let mut stream = SAStream::new(open_sa, text_slice, offset_slice, 0, 16384).unwrap();
+    let mut stream = SAStream::new(open_sa, text_slice, offset_slice, 0, 16384, sa_element_size).unwrap();
     let mut text_iterator = stream.text_iter(match_length);
     let prev_min = text_iterator.next();
     if prev_min.is_none() {

@@ -37,7 +37,7 @@ use std::u64;
 use sysinfo::System; 
 
 use self::SuffixType::{Ascending, Descending, Valley};
-use crate::compact_uint::CompactUint;
+use crate::compact_uint::{CompactUint, U40};
 
 
 
@@ -84,7 +84,38 @@ use crate::compact_uint::CompactUint;
 /// the number of unique characters in the text. This doesn't formally imply
 /// another byte of overhead, but in practice, the alphabet can get quite large
 /// when solving the subproblems mentioned above (even if the alphabet of the
+
+
 /// original text is very small).
+pub enum DynamicSuffixTable<'s, 't> {
+    U32(SuffixTableGeneric<'s, 't, u32>),
+    U40(SuffixTableGeneric<'s, 't, U40>),
+    U64(SuffixTableGeneric<'s, 't, u64>),
+}
+
+impl<'s, 't> DynamicSuffixTable<'s, 't> {
+    pub fn new<S>(text: S, size_hint: u64) -> Result<Self, &'static str>
+    where
+        S: Into<Cow<'s, [u8]>> + Clone,
+    {
+        if size_hint <= u32::MAX as u64 {
+            Ok(DynamicSuffixTable::U32(SuffixTableGeneric::new(text).unwrap()))
+        } else if size_hint <= U40::max_value() {
+            Ok(DynamicSuffixTable::U40(SuffixTableGeneric::new(text).unwrap()))
+        } else {
+            Ok(DynamicSuffixTable::U64(SuffixTableGeneric::new(text).unwrap()))
+        }
+    }
+
+    pub fn table(&self) -> &[u8] {
+        match self {
+            DynamicSuffixTable::U32(t) => bytemuck::cast_slice(t.table()),
+            DynamicSuffixTable::U40(t) => bytemuck::cast_slice(t.table()),
+            DynamicSuffixTable::U64(t) => bytemuck::cast_slice(t.table()),
+        }
+    }
+}
+
 
 #[derive(Clone, Eq, PartialEq)]
 pub struct SuffixTableGeneric<'s, 't, I: CompactUint = u64> {

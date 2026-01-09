@@ -26,6 +26,18 @@ use sysinfo::System;
 =                           UTILS                      =
 ======================================================*/
 
+pub fn get_byte_size(num_bytes: usize) -> usize {
+    // Gets the number of bytes needed for suffix table indices based on the text sizes
+    if num_bytes <= u32::MAX as usize {
+        4
+    } else if num_bytes <= (1u64 <<40 - 1) as usize {
+        5
+    } else {
+        8
+    }
+}
+
+
 pub fn read_u64_vec(p: &PathBuf) -> Result<Vec<u64>, Error> {
     let file_size = std::fs::metadata(&p)?.len() as usize;
     let mut output: Vec<u64> = vec![0u64; file_size / 8];
@@ -149,10 +161,11 @@ pub struct SAStream<'a, R: Read + ByteSize> {
     pub chunk_size: usize,
     pub source: usize,
     pub byte_size: u64,
+    pub element_size: usize,
 }
 
 impl<'a, R: Read + ByteSize> SAStream<'a, R> {
-    pub fn new(sa_file: R, text: &'a [u8], offset: &'a[u64], source: usize, chunk_size: usize) -> Result<Self, Error> {
+    pub fn new(sa_file: R, text: &'a [u8], offset: &'a[u64], source: usize, chunk_size: usize, element_size: usize) -> Result<Self, Error> {
     	let byte_size = sa_file.byte_size().unwrap();
 
         Ok(Self {
@@ -163,7 +176,8 @@ impl<'a, R: Read + ByteSize> SAStream<'a, R> {
             position: 0,
             chunk_size,
             source,
-            byte_size
+            byte_size, 
+            element_size
         })
     }
 
@@ -171,7 +185,7 @@ impl<'a, R: Read + ByteSize> SAStream<'a, R> {
         self.buffer.clear();
         self.position = 0;
 
-        let bytes_to_read = self.chunk_size * 8;
+        let bytes_to_read = self.chunk_size * self.element_size;
         let mut byte_buffer = vec![0u8; bytes_to_read];
 
         let mut total_read = 0;
@@ -185,9 +199,11 @@ impl<'a, R: Read + ByteSize> SAStream<'a, R> {
         }
 
         // Convert bytes to u64s
-        for chunk in byte_buffer[..total_read].chunks_exact(8) {
-            let bytes: [u8; 8] = chunk.try_into().unwrap();
-            self.buffer.push(u64::from_le_bytes(bytes));
+        for chunk in byte_buffer[..total_read].chunks_exact(self.element_size) {
+            let mut buf = [0u8; 8];
+            buf[..chunk.len()].copy_from_slice(chunk);
+
+            self.buffer.push(u64::from_le_bytes(buf));
         }
 
         Ok(!self.buffer.is_empty())
