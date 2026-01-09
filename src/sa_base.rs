@@ -19,6 +19,7 @@ use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use crate::table_old::SuffixTable;
+use crate::table_generic::SuffixTableGeneric;
 use anyhow::{Error, Result};
 use gjson;
 use mj_io::{
@@ -33,7 +34,7 @@ use std::collections::BinaryHeap;
 
 use crate::sa_utils::{FileRange, SAStream, TextIterator, MatchWriter, MatchWriterElement, TreeNode, LoserTree, read_u64_vec, sa_safety_check, calculate_bytes_per_chunk, ByteSize};
 use crate::sa_config::{SAConfigOverrides, SAConfig};
-
+use crate::compact_uint::U40;
 /*
 
 Scaling notes:
@@ -214,7 +215,7 @@ pub fn make_sa_tables(
         write_mem_to_pathbuf(offset_vec, &output_offset_filename).unwrap();
 
         // And then make the SA table too
-        let table = SuffixTable::new(buf);
+        let table: SuffixTableGeneric<'_, '_, > = SuffixTableGeneric::new(buf).unwrap();
         total_pbar.inc(1);
 
         let table_to_write: &[u8] = bytemuck::cast_slice(table.table());
