@@ -504,9 +504,9 @@ pub fn get_matches_parallel(storage_dir: &PathBuf, match_length: usize) -> Resul
     println!("Starting parallel match-finding...");
     let thread_pbar = build_pbar(thread_iters.len(), "Jobs");
 
-    //pbar = build_pbar()
+    let random_pbar_thread = rand::thread_rng().gen_range(0..thread_iters.len());        
     thread_iters.par_iter_mut().enumerate().for_each(|(part_num, streams)| {
-        get_matches_parallel_thread(streams, &match_writer, match_length, part_num==0, part_num).unwrap();
+        get_matches_parallel_thread(streams, &match_writer, match_length, part_num==random_pbar_thread, part_num).unwrap();
         thread_pbar.inc(1);
     });
     match_writer.finish().unwrap();
@@ -742,6 +742,7 @@ fn get_matches_parallel_thread<'a, R: Read + ByteSize>(
     let pbar_opt = if use_pbar {
     	let total_size: usize = streams.iter().map(|(_k,v)| v.byte_size as usize / v.element_size).sum::<usize>();
     	let pbar = build_pbar(total_size, "Thread bytes");
+        pbar.enable_steady_tick(std::time::Duration::from_millis(1000));        
     	Some(pbar)
     } else {
     	None
