@@ -724,6 +724,9 @@ enum Commands {
 
         #[arg(long)]
         text_key: Option<String>,
+
+        #[arg(long, default_value_t=1.0)]
+        batch_size: f32,
     },
 
     #[clap(arg_required_else_help = true)]
@@ -993,6 +996,7 @@ fn main() {
             tokenizer,
             max_lines_per_path,
             text_key,
+            batch_size
         } => make_sa_tables_cmd(
             input_dir,
             output_dir,
@@ -1001,6 +1005,7 @@ fn main() {
             tokenizer.clone(),
             max_lines_per_path.clone(),
             text_key.clone(),
+            *batch_size
         ),
 
         Commands::SaGetMatchesSerial {
