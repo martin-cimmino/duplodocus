@@ -34,7 +34,7 @@ use std::path::PathBuf;
 
 use std::cmp::Ordering as StdOrdering;
 
-use crate::sa_utils::{SAStream, MatchWriter, MatchWriterElement, LoserTree, read_u64_vec, calculate_bytes_per_chunk, get_byte_size, MmapRangeReader, adaptive_batch_size};
+use crate::sa_utils::{SAStream, MatchWriter, MatchWriterElement, LoserTree, read_u64_vec, get_byte_size, MmapRangeReader, adaptive_batch_size};
 use crate::sa_config::{SAConfigOverrides, SAConfig};
 /*
 
@@ -156,16 +156,11 @@ pub fn make_sa_tables(
 
     // Safety check:
     let corpus_len: usize = data_docs.par_iter().map(|(_, _, doc)| doc.len() + 2 * 8).sum();
-    let thread_count = if batch_size == 0.0 {
+    let num_tables = if batch_size == 0.0 {
         adaptive_batch_size(corpus_len, MEMORY_SAFETY_MARGIN)
     } else {
         (rayon::current_num_threads() as f32 * batch_size) as usize        
     };
-
-    let chunk_text_byte_size = calculate_bytes_per_chunk(thread_count, MEMORY_SAFETY_MARGIN);
-
-
-
 
     // Step 2 (optional): Tokenize if needed
     // TODO: tokenizer thing
@@ -173,12 +168,12 @@ pub fn make_sa_tables(
 
     // Step 3: Break into chunks and make SA table for each of them
     let start_chunk = Instant::now(); //DEBUG
-    let owned_chunks: DashMap<usize, Vec<(usize, usize, String)>> = chunk_data_for_sa(config_obj, data_docs, chunk_text_byte_size, thread_count);
+    let owned_chunks: Vec<Vec<(usize, usize, String)>> = chunk_data_for_sa(config_obj, data_docs, num_tables);
 
     println!("Chunking took {:?} seconds", start_chunk.elapsed().as_secs()); //DEBUG
     let total_bytes = AtomicUsize::new(0);
 
-    let owned_chunk_sizes: Vec<(usize, Vec<(usize, usize, String)>, usize)> = owned_chunks.into_par_iter().map(|(table_idx, chunk)| {
+    let owned_chunk_sizes: Vec<(usize, Vec<(usize, usize, String)>, usize)> = owned_chunks.into_par_iter().enumerate().map(|(table_idx, chunk)| {
         let size = chunk
             .iter()
             .map(|(_, _, s)| s.len() + 2 + 2 * 8)
@@ -261,7 +256,7 @@ pub fn make_sa_tables(
 
     println!(
         "Made {:?} tables of {:?} bytes total in {:?} seconds",
-        thread_count,
+        num_tables,
         total_bytes.into_inner(),
         start_main.elapsed().as_secs()
     );
@@ -315,11 +310,8 @@ fn get_part_num(path: &PathBuf) -> Result<usize, Error> {
 fn chunk_data_for_sa(
     config: &SAConfig, 
     data_docs: Vec<(usize, usize, String)>, 
-    bytes_per_chunk: usize,
-    thread_count: usize
-) -> DashMap<usize, Vec<(usize, usize, String)>> {
-    let owned_chunks: DashMap<usize, Vec<(usize, usize, String)>> = DashMap::new();
-    let chunk_counter = AtomicUsize::new(0);
+    num_tables: usize
+) -> Vec<Vec<(usize, usize, String)>> {
     // Step 1: shuffle and index the data
     let mut indexed: Vec<(u64, (usize, usize, String))> = data_docs
         .into_par_iter()
@@ -331,42 +323,19 @@ fn chunk_data_for_sa(
         .collect();
     
     indexed.par_sort_unstable_by_key(|(key, _)| *key);
+    let indexed: Vec<(usize, usize, String)> = indexed.into_par_iter().map(|(_r, el)| el).collect();
 
-    // Step 2: distribute into thread buckets by MOVING (no clone!)
-    let mut chunks: Vec<Vec<_>> = (0..thread_count).map(|_| Vec::new()).collect();
-    
-    for (i, item) in indexed.into_iter().enumerate() {
-        chunks[i % thread_count].push(item);
+    let mut owned_chunks = Vec::with_capacity(num_tables);
+    let base_size = indexed.len() / num_tables;
+    let remainder = indexed.len() % num_tables;
+    let mut iter = indexed.into_iter();
+    for i in 0..num_tables {
+        let chunk_size = base_size + (i < remainder) as usize;
+        let chunk: Vec<(usize, usize, String)> = iter.by_ref().take(chunk_size).collect();
+        owned_chunks.push(chunk);
     }
-    
-    // Step 3: split each bucket into memory-bounded chunks
-    chunks.into_par_iter().for_each(|chunk| {
-        let mut current_part = chunk_counter.fetch_add(1, Ordering::SeqCst);
-        let mut current_size = 0;
-        let mut current_chunk = Vec::new();
-
-        for (_, (idx1, idx2, text)) in chunk {
-            let item_size = text.len() + 16; // approximate overhead
-            assert!(item_size < bytes_per_chunk, "Document too large for chunk limit!");
-            
-            if current_size + item_size > bytes_per_chunk && current_size > 0 {
-                // Flush current chunk
-                owned_chunks.insert(current_part, current_chunk);
-                current_chunk = Vec::new();
-                current_size = 0;
-                current_part = chunk_counter.fetch_add(1, Ordering::SeqCst);
-            }
-            
-            current_chunk.push((idx1, idx2, text));
-            current_size += item_size;
-        }
-        
-        // Don't forget the last chunk
-        if !current_chunk.is_empty() {
-            owned_chunks.insert(current_part, current_chunk);
-        }
-    });
     owned_chunks
+
 }
 
 
