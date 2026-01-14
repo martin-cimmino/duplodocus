@@ -49,11 +49,46 @@ pub fn read_u64_vec(p: &PathBuf) -> Result<Vec<u64>, Error> {
 }
 
 
+pub fn adaptive_batch_size(corpus_len: usize, safety_margin: f64) -> usize {
+    /*Peak memory usage is roughly the sum of :
+       - text + incidentals : 1.25 * corpus_len 
+       - suffix_tables: corpus_len * T / B 
+            where B is the number of batches and T is the size of each batch
+            where T ~~ ceil(log_2(corpus_len / (num_threads * batch_size)))
+            and B is decided adaptively here (but is an integer!)
+    */
+
+    let text_memory = corpus_len as f64 * 1.25;
+
+    let rayon_threads = rayon::current_num_threads() as f64;
+    let mut sys = System::new_all();
+    sys.refresh_memory();
+    let total_memory = sys.total_memory() as f64;
+
+    let safe_memory = total_memory * safety_margin;
+    assert!(text_memory < safe_memory);
+
+    let safe_table_memory = safe_memory - text_memory;
+    for batch_size in 1..=32 {
+        let table_byte_size = ((corpus_len as f64 / ((rayon_threads * batch_size as f64) as f64)).log2().ceil() as usize).max(4) ;
+        let cur_table_memory = corpus_len as f64 * table_byte_size as f64 / batch_size as f64;
+        if cur_table_memory < safe_table_memory {
+            println!("Okay to use batch size of {:?}", batch_size);
+            return batch_size * rayon_threads as usize
+        }
+    }
+
+    panic!("need a batch size >32! Try a smaller corpus!");
+    
+}
+
+
+
 pub fn sa_safety_check(text_len: usize) -> bool {
 	// Checks if we'll run out of RAM trying to make the SA array
-	let mut sys = System::new_all();
-	sys.refresh_memory();
-	let total_memory = sys.total_memory();
+    let mut sys = System::new_all();
+    sys.refresh_memory();
+    let total_memory = sys.total_memory();
 
 	let predicted_ram_usage = text_len * 12;
 	println!("Expecting to use at least {:.2}% of the RAM", predicted_ram_usage as f64 / total_memory as f64 * 100.0);

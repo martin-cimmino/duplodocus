@@ -34,7 +34,7 @@ use std::path::PathBuf;
 
 use std::cmp::Ordering as StdOrdering;
 
-use crate::sa_utils::{SAStream, MatchWriter, MatchWriterElement, LoserTree, read_u64_vec, sa_safety_check, calculate_bytes_per_chunk, get_byte_size, MmapRangeReader};
+use crate::sa_utils::{SAStream, MatchWriter, MatchWriterElement, LoserTree, read_u64_vec, calculate_bytes_per_chunk, get_byte_size, MmapRangeReader, adaptive_batch_size};
 use crate::sa_config::{SAConfigOverrides, SAConfig};
 /*
 
@@ -156,9 +156,12 @@ pub fn make_sa_tables(
 
     // Safety check:
     let corpus_len: usize = data_docs.par_iter().map(|(_, _, doc)| doc.len() + 2 * 8).sum();
-    // assert!(sa_safety_check(corpus_len));
-    sa_safety_check(corpus_len);
-    let thread_count = (rayon::current_num_threads() as f32 * batch_size) as usize;
+    let thread_count = if batch_size == 0.0 {
+        adaptive_batch_size(corpus_len, MEMORY_SAFETY_MARGIN)
+    } else {
+        (rayon::current_num_threads() as f32 * batch_size) as usize        
+    };
+
     let chunk_text_byte_size = calculate_bytes_per_chunk(thread_count, MEMORY_SAFETY_MARGIN);
 
 
