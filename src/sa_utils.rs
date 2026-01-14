@@ -70,7 +70,7 @@ pub fn adaptive_batch_size(corpus_len: usize, safety_margin: f64) -> usize {
 
     let safe_table_memory = safe_memory - text_memory;
     for batch_size in 1..=32 {
-        let table_byte_size = ((corpus_len as f64 / ((rayon_threads * batch_size as f64) as f64)).log2().ceil() as usize).max(4) ;
+        let table_byte_size = (((corpus_len as f64 / ((rayon_threads * batch_size as f64) as f64)).log2() / 8.0).ceil() as usize).max(4) ;
         let cur_table_memory = corpus_len as f64 * table_byte_size as f64 / batch_size as f64;
         if cur_table_memory < safe_table_memory {
             println!("Okay to use batch size of {:?}", batch_size);
