@@ -1,3 +1,5 @@
+use std::sync::Arc;
+use std::sync::Mutex;
 use crate::compact_uint::{CompactUint, U40};
 use rand::SeedableRng;
 use rand::Rng;
@@ -167,27 +169,31 @@ pub fn make_sa_tables(
 
 
     // Step 3: Break into chunks and make SA table for each of them
+    let start_chunk = Instant::now(); //DEBUG
     let owned_chunks: DashMap<usize, Vec<(usize, usize, String)>> = chunk_data_for_sa(config_obj, data_docs, chunk_text_byte_size, thread_count);
 
-    // PRINT BLOCK
-    let chunk_sizes: Vec<usize> = owned_chunks.par_iter().map(|entry| {
-    	let v = entry.value();
-    	v.iter().map(|(_, _, t)| t.len()).sum::<usize>()
-    }).collect();
-
-    println!("CHUNK BYTE LIMIT {:?} | CHUNK SIZES {:?}", chunk_text_byte_size, chunk_sizes); 
+    println!("Chunking took {:?} seconds", start_chunk.elapsed().as_secs()); //DEBUG
     let total_bytes = AtomicUsize::new(0);
 
-    let total_pbar = build_pbar(owned_chunks.len() * 3, "Total steps");
-    owned_chunks.into_par_iter().for_each(|(table_idx, chunk)| {
-        let allocate_size = chunk
+    let owned_chunk_sizes: Vec<(usize, Vec<(usize, usize, String)>, usize)> = owned_chunks.into_par_iter().map(|(table_idx, chunk)| {
+        let size = chunk
             .iter()
             .map(|(_, _, s)| s.len() + 2 + 2 * 8)
             .sum::<usize>();
+        (table_idx, chunk, size)
+    }).collect();
+    let byte_size = get_byte_size(*owned_chunk_sizes.iter().map(|(_, _, size)| size).max().unwrap());
+    let total_pbar = build_pbar(owned_chunk_sizes.len() * 3, "Total steps");
+
+    let phase_times = Arc::new(Mutex::new(Vec::new()));
+    owned_chunk_sizes.into_par_iter().for_each(|(table_idx, chunk, allocate_size)| {
+        let phase_start = Instant::now();
         let mut document_offsets: Vec<u64> = Vec::new();
         document_offsets.extend(vec![u64::MAX, u64::MAX, 0]);
         let mut buf = Vec::with_capacity(allocate_size);
+        let alloc_time = phase_start.elapsed();
 
+        let build_start = Instant::now();
         chunk.into_iter().for_each(|(u1, u2, s)| {
             buf.extend_from_slice(s.as_bytes());
             buf.extend_from_slice(&[0xff, 0xff]);
@@ -196,6 +202,15 @@ pub fn make_sa_tables(
             document_offsets.extend(vec![u1 as u64, u2 as u64, buf.len() as u64]);
             // Offsets are trips of (path_id, line_num, current_offset)
         });
+        let build_time = build_start.elapsed();
+
+        // And then make the SA table too
+        let sa_start = Instant::now();
+        let table = DynamicSuffixTable::new(&buf, byte_size).unwrap();
+        total_pbar.inc(1);
+        let sa_time = sa_start.elapsed();
+
+        let write_start = Instant::now();
         assert_eq!(document_offsets.len() % 3, 0);
         total_bytes.fetch_add(allocate_size, Ordering::SeqCst);
         total_pbar.inc(1);
@@ -215,16 +230,31 @@ pub fn make_sa_tables(
         let offset_vec: &[u8] = bytemuck::cast_slice(&document_offsets);
         write_mem_to_pathbuf(offset_vec, &output_offset_filename).unwrap();
 
-        // And then make the SA table too
-        let table = DynamicSuffixTable::new(&buf, buf.len() as u64).unwrap();
-        total_pbar.inc(1);
+
         let table_to_write: &[u8] = bytemuck::cast_slice(table.table());
         let output_table_filename = output_dir
             .clone()
             .join("table")
             .join(format!("table_part_{:04}.bin", table_idx));
         write_mem_to_pathbuf(table_to_write, &output_table_filename).unwrap();
+        let write_time = write_start.elapsed();
+
+        phase_times.lock().unwrap().push((
+            table_idx, 
+            alloc_time.as_millis(),
+            build_time.as_millis(),
+            sa_time.as_millis(),
+            write_time.as_millis()))
     });
+
+    let times = phase_times.lock().unwrap();
+    println!("Average alloc: {:?}ms, build: {:?}ms, SA: {:?}ms, write: {:?}ms",
+        times.iter().map(|t| t.1).sum::<u128>() / times.len() as u128,
+        times.iter().map(|t| t.2).sum::<u128>() / times.len() as u128,
+        times.iter().map(|t| t.3).sum::<u128>() / times.len() as u128,
+        times.iter().map(|t| t.4).sum::<u128>() / times.len() as u128,
+    );
+
 
     println!(
         "Made {:?} tables of {:?} bytes total in {:?} seconds",

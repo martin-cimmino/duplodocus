@@ -94,17 +94,18 @@ pub enum DynamicSuffixTable<'s, 't> {
 }
 
 impl<'s, 't> DynamicSuffixTable<'s, 't> {
-    pub fn new<S>(text: S, size_hint: u64) -> Result<Self, &'static str>
+    pub fn new<S>(text: S, byte_size: usize) -> Result<Self, &'static str>
     where
         S: Into<Cow<'s, [u8]>> + Clone,
     {
-        if size_hint <= u32::MAX as u64 {
-            Ok(DynamicSuffixTable::U32(SuffixTableGeneric::new(text).unwrap()))
-        } else if size_hint <= U40::max_value() {
-            Ok(DynamicSuffixTable::U40(SuffixTableGeneric::new(text).unwrap()))
-        } else {
-            Ok(DynamicSuffixTable::U64(SuffixTableGeneric::new(text).unwrap()))
+        match byte_size {
+            4 => Ok(DynamicSuffixTable::U32(SuffixTableGeneric::new(text).unwrap())),
+            5 => Ok(DynamicSuffixTable::U40(SuffixTableGeneric::new(text).unwrap())),
+            8 => Ok(DynamicSuffixTable::U64(SuffixTableGeneric::new(text).unwrap())),
+            _ => panic!("Unsupported byte size {}", byte_size)            
+
         }
+
     }
 
     pub fn table(&self) -> &[u8] {
