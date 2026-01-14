@@ -24,7 +24,7 @@ pub trait CompactUint:
     fn zero() -> Self;
     
     /// Return the maximum value as Self.
-    fn max_I() -> Self;
+    fn max_i() -> Self;
 
     /// The size of this type in bytes.
     const BYTE_SIZE: usize;
@@ -54,7 +54,7 @@ impl CompactUint for u32 {
     }
     
     #[inline(always)]
-    fn max_I() -> Self {
+    fn max_i() -> Self {
         u32::MAX
     }
     
@@ -84,7 +84,7 @@ impl CompactUint for u64 {
     }
     
     #[inline(always)]
-    fn max_I() -> Self {
+    fn max_i() -> Self {
         u64::MAX
     }
     
@@ -160,7 +160,7 @@ impl CompactUint for U40 {
     }
     
     #[inline(always)]
-    fn max_I() -> Self {
+    fn max_i() -> Self {
         U40([0xFF, 0xFF, 0xFF, 0xFF, 0xFF])
     }
     
@@ -178,6 +178,34 @@ impl fmt::Display for U40 {
         write!(f, "{}", self.to_u64())
     }
 }
+
+
+#[inline(always)]
+pub fn read_compact_uint_fast<T: CompactUint>(bytes: &[u8]) -> T {
+    match T::BYTE_SIZE {
+        4 => {
+            // Cast 4 bytes directly to u32
+            let arr: [u8; 4] = bytes[..4].try_into().unwrap();
+            T::from_u64(u32::from_le_bytes(arr) as u64)
+        }
+        5 => {
+            // U40: read 5 bytes
+            T::from_u64(
+                u64::from_le_bytes([
+                    bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], 0, 0, 0
+                ])
+            )
+        }
+        8 => {
+            // Cast 8 bytes directly to u64
+            let arr: [u8; 8] = bytes[..8].try_into().unwrap();
+            T::from_u64(u64::from_le_bytes(arr))
+        }
+        _ => unreachable!(),
+    }
+}
+
+
 
 #[cfg(test)]
 mod tests {

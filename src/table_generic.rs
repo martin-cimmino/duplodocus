@@ -528,7 +528,7 @@ where
     // We set our "name buffer" to be max u64 values. Since there are at
     // most n/2 wstrings, a name can never be greater than n/2.
     for i in num_wstrs..(sa.len() as u64) {
-        sa[i as usize] = I::max_I();
+        sa[i as usize] = I::max_i();
     }
     for i in 0..num_wstrs {
         let cur_sufi = sa[i as usize].to_u64();
@@ -546,7 +546,7 @@ where
     // array, but it's sparse. so let's smush them all up to the end.
     let mut j = sa.len() as u64 - 1;
     for i in (num_wstrs..(sa.len() as u64)).rev() {
-        if sa[i as usize] != I::max_I() {
+        if sa[i as usize] != I::max_i() {
             sa[j as usize] = sa[i as usize];
             j -= 1;
         }

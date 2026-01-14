@@ -1,25 +1,24 @@
+use crate::compact_uint::{CompactUint, U40, read_compact_uint_fast};
 use ahash::HashMap;
 use dashmap::DashMap;
 use std::fs::create_dir_all;
 use std::fs::File;
 use std::fs::OpenOptions;
-use std::io::BufReader;
 use std::io::BufWriter;
 use std::io::Read;
-use std::io::Seek;
-use std::io::SeekFrom;
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use anyhow::{Context, Error, Result};
+use anyhow::{Error, Result};
 use rayon;
 use rayon::prelude::*;
 use std::path::PathBuf;
 use indicatif::ProgressBar;
 use std::cmp::Ordering as StdOrdering;
 use sysinfo::System;
+use memmap2::Mmap;
 
 
 /*======================================================
@@ -95,205 +94,170 @@ pub fn calculate_bytes_per_chunk(num_threads: usize, safety_margin: f64) -> usiz
 /*======================================================================
 =                            FILE STREAM STUFF                         =
 ======================================================================*/
-
 pub trait ByteSize {
-	fn byte_size(&self) -> Result<u64, Error>;
+    fn byte_size(&self) -> Result<u64, Error>;
 }
 
-impl ByteSize for File {
-	fn byte_size(&self) -> Result<u64, Error> {
-		Ok(self.metadata().unwrap().len())
-	}
+pub struct MmapRangeReader {
+    mmap: Mmap,
+    position: usize,
+    start: usize, // Offset within the memmap where the range starts
+    end: usize, // Offset within the memmap where the range ends (standard slicing format)
 }
 
-#[allow(dead_code)]
-pub struct FileRange {
-    file: File,
-    start: u64,
-    end: u64,
-    current: u64,
-}
-impl FileRange {
-    pub fn new(mut file: File, start: u64, end: u64) -> Result<Self, Error> {
-        // Seek to the start position
-        file.seek(SeekFrom::Start(start)).unwrap();
-
-        Ok(FileRange {
-            file,
-            start,
-            end,
-            current: start,
+impl MmapRangeReader {
+    pub fn new(file: &File) -> Result<Self, Error> {
+        let mmap = unsafe { Mmap::map(file).unwrap() };
+        let len = mmap.len();
+        Ok(Self {
+            mmap,
+            position: 0,
+            start: 0,
+            end: len,
         })
+    }
+
+    pub fn from_range(file: &File, offset: u64, length: u64) -> Result<Self, Error> {
+        let mmap = unsafe {
+            memmap2::MmapOptions::new()
+                .offset(offset)
+                .len(length as usize)
+                .map(file).unwrap()
+        };
+
+        let len = mmap.len();
+        Ok(Self {
+            mmap,
+            position: 0,
+            start: 0,
+            end: len
+        })
+    }
+
+    pub fn remaining(&self) -> usize {
+        self.end.saturating_sub(self.start + self.position)
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        &self.mmap[self.start..self.end]
     }
 }
 
-impl Read for FileRange {
-    fn read(&mut self, buf: &mut [u8]) -> Result<usize, std::io::Error> {
-        // Calculate how many bytes we can still read
-        let remaining = self.end.saturating_sub(self.current);
 
-        if remaining == 0 {
+impl Read for MmapRangeReader {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, std::io::Error> {
+        if self.position >= self.end - self.start { 
             return Ok(0); // EOF
         }
+        let remaining = &self.mmap[self.start + self.position..self.end];
+        let to_read = buf.len().min(remaining.len());
+        buf[..to_read].copy_from_slice(&remaining[..to_read]);
+        self.position += to_read;
+        Ok(to_read)
+    }    
+}
 
-        // Limit the read to not exceed our range
-        let to_read = std::cmp::min(buf.len() as u64, remaining) as usize;
-        let n = self.file.read(&mut buf[..to_read]).unwrap();
-
-        self.current += n as u64;
-        Ok(n)
+impl ByteSize for MmapRangeReader {
+    fn byte_size(&self) -> Result<u64, Error> {
+        Ok((self.end - self.start) as u64)
     }
 }
 
-impl ByteSize for FileRange {
-	fn byte_size(&self) -> Result<u64, Error> {
-		Ok(self.end - self.start)
-	}
+
+
+pub enum SAStreamDyn<'a> {
+    U32(SAStream<'a, u32>),
+    U40(SAStream<'a, U40>),
+    U64(SAStream<'a, u64>),
 }
 
 
-pub struct SAStream<'a, R: Read + ByteSize> {
-    pub reader: BufReader<R>,
+
+pub struct SAStream<'a, T: CompactUint> {
+    pub reader: MmapRangeReader,
     pub text: &'a [u8],
     pub offset: &'a [u64], 
-    pub buffer: Vec<u64>,
-    pub position: usize,
-    pub chunk_size: usize,
+    position: usize, // Position in elements (not bytes!)
     pub source: usize,
-    pub byte_size: u64,
-    pub element_size: usize,
+    pub total_elements: usize,
+    next_call_counter: usize,
+    pub min_len: usize,
+    batch_buffer: Vec<T>,
+    batch_pos: usize,
+
+    _phantom: std::marker::PhantomData<T>
 }
 
-impl<'a, R: Read + ByteSize> SAStream<'a, R> {
-    pub fn new(sa_file: R, text: &'a [u8], offset: &'a[u64], source: usize, chunk_size: usize, element_size: usize) -> Result<Self, Error> {
-    	let byte_size = sa_file.byte_size().unwrap();
+impl<'a, T: CompactUint> SAStream<'a, T> {
 
+    pub fn new(
+        reader: MmapRangeReader,
+        text: &'a [u8],
+        offset: &'a [u64],
+        source: usize,
+        min_len: usize,
+        ) -> Result<Self, Error> {
+        let byte_size = reader.byte_size().unwrap();
+        let total_elements = (byte_size as usize) / T::BYTE_SIZE;
         Ok(Self {
-            reader: BufReader::new(sa_file),
-            text: text,
-            offset: offset,
-            buffer: Vec::with_capacity(chunk_size),
+            reader,
+            text, 
+            offset,
             position: 0,
-            chunk_size,
             source,
-            byte_size, 
-            element_size
+            total_elements,
+            next_call_counter: 0,
+            min_len,
+            batch_buffer: Vec::new(),
+            batch_pos: 0,
+            _phantom: std::marker::PhantomData,
         })
     }
 
-    fn refill_buffer(&mut self) -> Result<bool> {
-        self.buffer.clear();
-        self.position = 0;
+    #[inline(always)]
+    fn read_next_batch(reader: &MmapRangeReader,
+                       position: &mut usize,
+                       total_elements: usize,
+                       output: &mut [T]) -> usize {
+        let available = total_elements - *position;
+        let to_read = output.len().min(available);
+        if to_read == 0 {
+            return 0;            
+        }
 
-        let bytes_to_read = self.chunk_size * self.element_size;
-        let mut byte_buffer = vec![0u8; bytes_to_read];
+        let byte_offset = *position * T::BYTE_SIZE;
+        let bytes_to_read = to_read * T::BYTE_SIZE;
+        let slice = &reader.as_slice()[byte_offset..byte_offset + bytes_to_read];
 
-        let mut total_read = 0;
-        while total_read < bytes_to_read {
-            match self.reader.read(&mut byte_buffer[total_read..]) {
-                Ok(0) => break, // EOF
-                Ok(n) => total_read += n,
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(e).context("Failed to read from file"),
+        for (i, chunk) in slice.chunks_exact(T::BYTE_SIZE).enumerate() {
+            output[i] = read_compact_uint_fast::<T>(chunk);
+        }
+
+        *position += to_read;
+        to_read        
+    }
+
+    #[inline(always)]
+    fn read_next_el(&mut self) -> Result<Option<T>, Error> {
+        if self.batch_pos >= self.batch_buffer.len() {
+            self.batch_buffer.clear();
+            self.batch_buffer.resize(8192.min(self.total_elements - self.position), T::zero());
+            let read = SAStream::<'a, T>::read_next_batch(&self.reader, &mut self.position, self.total_elements, &mut self.batch_buffer);
+            if read == 0 {
+                return Ok(None)
             }
+            self.batch_buffer.truncate(read);
+            self.batch_pos = 0;            
         }
-
-        // Convert bytes to u64s
-        for chunk in byte_buffer[..total_read].chunks_exact(self.element_size) {
-            let mut buf = [0u8; 8];
-            buf[..chunk.len()].copy_from_slice(chunk);
-
-            self.buffer.push(u64::from_le_bytes(buf));
-        }
-
-        Ok(!self.buffer.is_empty())
+        let value = self.batch_buffer[self.batch_pos];
+        self.batch_pos += 1;
+        Ok(Some(value))
     }
 
-    pub fn text_iter<'stream>(&'stream mut self, min_len: usize) -> TextIterator<'stream, 'a, R> {
-        TextIterator {
-            stream: self,
-            next_call_counter: 0 as u64,
-            min_len,
-        }
-    }
-}
-
-impl<'a, R: Read + ByteSize> Iterator for SAStream<'a, R> {
-    type Item = Result<u64, Error>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.position >= self.buffer.len() {
-            match self.refill_buffer() {
-                Ok(true) => {}
-                Ok(false) => return None, // EOF
-                Err(e) => return Some(Err(e)),
-            }
-        }
-
-        if self.position < self.buffer.len() {
-            let value = self.buffer[self.position];
-            self.position += 1;
-            Some(Ok(value))
-        } else {
-            None
-        }
-    }
-}
-
-pub struct TextIterator<'stream, 'a, R: Read> where R: ByteSize, R: ByteSize {
-    pub stream: &'stream mut SAStream<'a, R>,
-    pub next_call_counter: u64,
-    min_len: usize,
-}
 
 
-#[allow(unreachable_code)]
-impl<'stream, 'a, R: Read + ByteSize> Iterator for TextIterator<'stream, 'a, R> {
-    type Item = Result<TreeNode<'a>, Error>;
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            self.next_call_counter += 1;
-            let next_idx_opt = self.stream.next();
-            if let Some(next_idx) = next_idx_opt {
-                let next_idx = next_idx.unwrap();            
-                if next_idx as usize + self.min_len > self.stream.text.len() {
-                    continue;
-                }
-                let next_eos = self.next_eos(next_idx as usize).unwrap() as usize;
-                if next_eos < next_idx as usize + self.min_len {
-                	continue
-                }
-                let slice_end = std::cmp::min(next_eos, next_idx as usize + self.min_len);
-                let slice = &self.stream.text[next_idx as usize..slice_end];
-                let rest_of_doc = &self.stream.text[slice_end..next_eos];
-                let prev_char: Option<u8> = if next_idx > 0 {
-                	let prev_char = (&self.stream.text.get(next_idx as usize - 1)).clone().unwrap();
-                	Some(*prev_char)
-                } else {
-                	None
-                };               
-
-                return Some(Ok(TreeNode {
-                    sa_idx: self.next_call_counter - 1,
-                    sa_value: next_idx,
-                    cmp_bytes: slice,
-                    source: self.stream.source,
-                    prev_char: prev_char,
-                    rest_of_doc: rest_of_doc,
-                }));
-            } else {
-                return None;
-            }
-        }
-        None
-    }
-
-}
-
-impl<'stream, 'a, R: Read + ByteSize> TextIterator<'stream, 'a, R> {
-	pub fn next_eos(&self, idx: usize) -> Result<u64, Error> {
-		// Gets the next element in the offset array that is >= idx, using binary search
-		let offset: &[u64] = self.stream.offset;
+    pub fn next_eos(&self, idx: usize) -> Result<u64, Error> {
+        let offset: &[u64] = self.offset;
         // Binary search for the first element >= idx
         let mut left = 0;
         let mut right = offset.len() / 3;
@@ -309,50 +273,62 @@ impl<'stream, 'a, R: Read + ByteSize> TextIterator<'stream, 'a, R> {
                 right = mid;
             }
         }
-        Ok(*offset.get(left * 3+ 2).unwrap())
-	}
+        Ok(*offset.get(left * 3+ 2).unwrap())        
+    }
 
-    fn next_counter(&mut self) -> (u64, Option<Result<TreeNode<'a>, Error>>) {
+}
+
+
+impl<'a, T: CompactUint> Iterator for SAStream<'a, T> {    
+    type Item = Result<(u64, Option<TreeNode<'a>>), Error>;
+
+
+    fn next(&mut self) -> Option<Self::Item> {
         let mut loop_counter: u64 = 0;
         loop {
-            self.next_call_counter += 1;
-            loop_counter += 1;
-            let next_idx_opt = self.stream.next();
-            if let Some(next_idx) = next_idx_opt {
-                let next_idx = next_idx.unwrap();
-                if next_idx as usize + self.min_len > self.stream.text.len() { // overruns the endpoint of the stream, skip
-                    continue;
-                }
+            self.next_call_counter += 1usize;
+            loop_counter += 1;            
+            let next_idx_val = match self.read_next_el().unwrap() {
+                Some(idx) => idx,
+                None => return Some(Ok((loop_counter, None)))
+            };
+            let next_idx = next_idx_val.to_u64() as usize;
 
-                
-                let next_eos = self.next_eos(next_idx as usize).unwrap() as usize;                
-                if next_eos < next_idx as usize + self.min_len { // overruns the endpoint of the doc, skip
-                    continue
-                }
-                let slice_end = std::cmp::min(next_eos, next_idx as usize + self.min_len);                
-                let slice = &self.stream.text[next_idx as usize..slice_end];
-                let rest_of_doc = &self.stream.text[slice_end..next_eos];                
-                let prev_char: Option<u8> = if next_idx > 0 {
-                    let prev_char = (&self.stream.text.get(next_idx as usize - 1)).clone().unwrap();
-                    Some(*prev_char)
-                } else {
-                    None 
-                };               
-
-                return (loop_counter, Some(Ok(TreeNode {
-                    sa_idx: self.next_call_counter - 1,
-                    sa_value: next_idx,
-                    cmp_bytes: slice,
-                    source: self.stream.source,
-                    prev_char: prev_char,
-                    rest_of_doc: rest_of_doc
-                })));
-            } else {
-                return (loop_counter, None);
+            if next_idx + self.min_len > self.text.len() { // overruns endpoint of the stream, skip
+                continue
             }
+
+            let next_eos = self.next_eos(next_idx).unwrap() as usize;
+
+            if next_eos < next_idx + self.min_len { // remainder of doc is shorter than min_len, skip
+                continue
+            }   
+
+
+            let slice_end = next_idx + self.min_len;
+            let slice = &self.text[next_idx..slice_end];
+            let rest_of_doc = &self.text[slice_end..next_eos];
+            let prev_char: Option<u8> = if next_idx > 0 {
+                self.text.get(next_idx - 1).copied()
+            } else {
+                None
+            };
+        
+
+            let tree_output = Some(TreeNode {
+                sa_idx: (self.next_call_counter - 1usize) as u64,
+                sa_value: next_idx_val.to_u64(),
+                cmp_bytes: slice,
+                source: self.source,
+                prev_char, 
+                rest_of_doc                    
+            });
+
+            return Some(Ok((loop_counter, tree_output)));    
         }
     }
 }
+
 
 
 
@@ -552,34 +528,34 @@ impl <'a> TreeNode<'a> {
 
 
 /// Loser Tree for efficient k-way merging
-pub struct LoserTree<'a, 'stream: 'a, R: Read + ByteSize> {
+pub struct LoserTree<'a, T: CompactUint> {
     tree: Vec<Option<TreeNode<'a>>>, // Internal nodes store losers
     loser: Option<TreeNode<'a>>,     // Current minimum element
     pub shortcut_count: usize,
-    iterators: HashMap<usize, TextIterator<'stream, 'a, R>>, // Input sequences
+    iterators: &'a mut HashMap<usize, SAStream<'a, T>>, // Input sequences
     path_idxs: Vec<Vec<usize>>,
     pbar_opt: Option<ProgressBar>,
 }
 
-impl<'a, 'stream: 'a, R: Read + ByteSize> LoserTree<'a, 'stream, R> {
+impl<'a, T: CompactUint> LoserTree<'a, T> {
     /// Create a new loser tree from k iterators
-    pub fn new(mut iterators: HashMap<usize, TextIterator<'stream, 'a, R>>, pbar_opt: Option<ProgressBar>) -> Self {
+    pub fn new(iterators: &'a mut HashMap<usize, SAStream<'a, T>>, pbar_opt: Option<ProgressBar>) -> Self {
         let k = iterators.len();
 
         // Tree needs k-1 internal nodes for k leaves
-        let tree_size = LoserTree::<R>::calculate_loser_tree_size(k);
+        let tree_size = LoserTree::<T>::calculate_loser_tree_size(k);
         let mut tree = vec![None; tree_size];
 
         // Initialize leaves with first element from each iterator
         let mut leaves: Vec<Option<TreeNode<'a>>> = (0..k)
             .map(|source| {
                 if let Some(iter) = iterators.get_mut(&source) {        
-                    let (counter, next_el) = iter.next_counter();
+                    let (counter, next_el) = iter.next().unwrap().unwrap();
                     if let Some(ref pbar) = pbar_opt {
                         pbar.inc(counter);
                     }
                     if let Some(node) = next_el {
-                        Some(node.unwrap())
+                        Some(node)
                     } else {
                         None
                     }
@@ -590,7 +566,7 @@ impl<'a, 'stream: 'a, R: Read + ByteSize> LoserTree<'a, 'stream, R> {
             .collect();
 
         let path_idxs: Vec<Vec<usize>> = (0..k)
-            .map(|i| LoserTree::<R>::get_path_indices(i, k))
+            .map(|i| LoserTree::<T>::get_path_indices(i, k))
             .collect();
 
         // Build the initial tree
@@ -673,10 +649,10 @@ impl<'a, 'stream: 'a, R: Read + ByteSize> LoserTree<'a, 'stream, R> {
     pub fn pop(&mut self) -> Result<Option<TreeNode<'a>>, Error> {
         let loser = self.loser.take().unwrap();
         let source = loser.source;
-        let (counter, next_el) = self.iterators.get_mut(&source).unwrap().next_counter();
+        let (counter, next_el) = self.iterators.get_mut(&source).unwrap().next().unwrap().unwrap();
         self.inc_pbar_opt(counter);
         let new_tree_entry = if let Some(node) = next_el {
-            Some(node.unwrap())
+            Some(node)
         } else {
             None
         };
@@ -689,12 +665,12 @@ impl<'a, 'stream: 'a, R: Read + ByteSize> LoserTree<'a, 'stream, R> {
         let loser = self.loser.take().unwrap();
         let loser_source = loser.source;
 
-        let (counter, next_el) = self.iterators.get_mut(&loser_source).unwrap().next_counter();
+        let (counter, next_el) = self.iterators.get_mut(&loser_source).unwrap().next().unwrap().unwrap();
         self.inc_pbar_opt(counter);
 
         let new_tree_entry =
             if let Some(node) = next_el {
-                let new_node = node.unwrap();
+                let new_node = node;
                 match self.tree.last() {
                     Some(None) => {
                         self.shortcut_count += 1;
@@ -723,11 +699,11 @@ impl<'a, 'stream: 'a, R: Read + ByteSize> LoserTree<'a, 'stream, R> {
     pub fn pop_verbose(&mut self) -> Result<Option<TreeNode<'a>>, Error> {
         let loser = self.loser.take().unwrap();
         let source = loser.source;
-        let (counter, next_el) = self.iterators.get_mut(&source).unwrap().next_counter();
+        let (counter, next_el) = self.iterators.get_mut(&source).unwrap().next().unwrap().unwrap();
         self.inc_pbar_opt(counter);
 
         let new_tree_entry = if let Some(node) = next_el {
-            Some(node.unwrap())
+            Some(node)
         } else {
             None
         };

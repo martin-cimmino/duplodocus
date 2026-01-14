@@ -86,7 +86,6 @@
 //! ```
 
 // External crates
-use crate::sa_base::alternative_merge;
 use clap::{Parser, Subcommand};
 
 // Standard library
@@ -1030,12 +1029,6 @@ fn main() {
             text_key,
         } => sa_annotate_files(input_dir, storage_dir, output_dir, annotate_key, text_key.clone()),
 
-        Commands::SaAlt {
-            text,
-            offset,
-            sa_table,
-            match_length,
-        } => alternative_merge(text, offset, sa_table, *match_length),
 
         _ => Ok(()),
     };
