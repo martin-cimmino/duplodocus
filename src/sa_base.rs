@@ -516,8 +516,6 @@ fn get_matches_parallel_typed<T: CompactUint>(
 
 
     let match_writer = MatchWriter::new(&storage_dir.clone().join("matches")).unwrap();
-    let random_pbar_thread = rand::thread_rng().gen_range(0..text_lookup.len());        
-    let thread_pbar = build_pbar(text_lookup.len(), "Jobs");
 
 
     // Get a #threads-1 list of internal boundaries to make #threads streams for each part
@@ -541,6 +539,8 @@ fn get_matches_parallel_typed<T: CompactUint>(
                     thread_iters[thread_num].insert(part_num, stream);
                 })
         });
+    let random_pbar_thread = rand::thread_rng().gen_range(0..thread_iters.len());        
+    let thread_pbar = build_pbar(text_lookup.len(), "Jobs");
 
     // And set up the matches writers
     // Finally we can do the parallel merge thing:
