@@ -24,6 +24,7 @@ use crate::storage::{compute_sig_size, to_byte_size, IntValueEnum, SignatureWrit
 use crate::uf_rush2::{parent as uf_parent, UFRush};
 use ahash::RandomState;
 use anyhow::{Error, Result};
+use base64::{engine::general_purpose, Engine as _};
 use dashmap::DashMap;
 use glob::glob;
 use mj_io::{
@@ -37,6 +38,7 @@ use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 use rayon::prelude::*;
 use regex::Regex;
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use sha2::Sha256;
@@ -191,10 +193,12 @@ impl OmniTokenizer {
                 // Valid tokenizer, proceed
             }
             _ => {
-                return Err(Error::msg(format!(
-                    "Unknown tokenizer: '{}'. Supported tokenizers are: p50k, cl100k, uniseg, bytes",
-                    tokenizer_name
-                )));
+                println!("Loading domyn-edge tokenizer");
+                let inner = load_domyn_edge_tokenizer(tokenizer_name).unwrap();
+                return Ok(OmniTokenizer {
+                    tokenizer_name: "domyn-edge".to_string(),
+                    inner,
+                });
             }
         }
 
@@ -225,6 +229,7 @@ impl OmniTokenizer {
                 })
                 .collect(),
             "bytes" => text.bytes().map(|b| b as usize).collect(),
+            "domyn-edge" => self.inner.encode_with_special_tokens(text),
             _ => {
                 panic!(
                     "Unknown tokenizer: '{}'. Supported tokenizers are p50k, cl100k, uniseg, bytes",
@@ -233,6 +238,41 @@ impl OmniTokenizer {
             }
         }
     }
+}
+
+fn load_domyn_edge_tokenizer(path: &str) -> Result<CoreBPE> {
+    let tokenizer = fs::read_to_string(path).unwrap();
+
+    let mut encoder = FxHashMap::default();
+    for line in tokenizer.lines() {
+        let mut parts = line.split(' ');
+        let raw = parts.next().unwrap();
+        let token = &general_purpose::STANDARD.decode(raw)?;
+        let rank = parts.next().unwrap().parse().unwrap();
+        encoder.insert(token.clone(), rank);
+    }
+
+    let mut special_tokens = FxHashMap::default();
+    special_tokens.insert(String::from("<|beginoftext|>"), 115256);
+    special_tokens.insert(String::from("<|endoftext|>"), 115257);
+    special_tokens.insert(String::from("<|im_start|>"), 115258);
+    special_tokens.insert(String::from("<|im_end|>"), 115259);
+    special_tokens.insert(String::from("<tool_call>"), 115260);
+    special_tokens.insert(String::from("</tool_call>"), 115261);
+    special_tokens.insert(String::from("<repo_name>"), 115262);
+    special_tokens.insert(String::from("<file_sep>"), 115263);
+    special_tokens.insert(String::from("<tool_response>"), 115264);
+    special_tokens.insert(String::from("</tool_response>"), 115265);
+    special_tokens.insert(String::from("<think>"), 115266);
+    special_tokens.insert(String::from("</think>"), 115267);
+    special_tokens.insert(String::from("<|pad|>"), 115268);
+
+    let bpe = CoreBPE::new(
+        encoder,
+        special_tokens,
+        "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+",
+    )?;
+    Ok(bpe)
 }
 
 /// Computes MinHash signatures for all documents in the assigned path chunk.
