@@ -18,21 +18,19 @@
 //! - **Edge Gathering**: Parallel across band IDs
 //! - **Union-Find**: Must run globally (no multi-node parallelism)
 //! - **Cleaning**: Parallel across file path chunks
-
 use crate::minhash_config::Config;
 use crate::storage::GenWriter;
 use crate::storage::{compute_sig_size, to_byte_size, IntValueEnum, SignatureWriter};
 use crate::uf_rush2::{parent as uf_parent, UFRush};
-use crate::utils::json_set;
 use ahash::RandomState;
 use anyhow::{Error, Result};
 use dashmap::DashMap;
 use glob::glob;
 use mj_io::{
-    build_pbar, create_writer, expand_dirs, get_output_filename, read_pathbuf, read_pathbuf_to_mem,
-    write_mem_to_pathbuf,
+    build_pbar, expand_dirs, get_output_filename, read_pathbuf_to_mem, write_mem_to_pathbuf,
 };
 use ndarray::Array1;
+use polars::prelude::*;
 use rand::Rng;
 use rand::RngCore;
 use rand::SeedableRng;
@@ -40,9 +38,6 @@ use rand_chacha::ChaCha20Rng;
 use rayon::prelude::*;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
-use serde_json::Value as JSONValue;
-use serde_yaml::Value;
 use sha2::Digest;
 use sha2::Sha256;
 use std::collections::HashMap;
@@ -52,7 +47,6 @@ use std::fs::create_dir_all;
 use std::fs::OpenOptions;
 use std::hash::BuildHasher;
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::io::BufRead;
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::panic::catch_unwind;
@@ -395,8 +389,15 @@ fn process_path(
     sig_size: usize,
     content_key: &str,
 ) -> Result<usize, Error> {
-    // Setup things: load data, build tokenizer, etc
-    let data = read_pathbuf(path, true).unwrap();
+    let plpath = PlPath::from_str(path.to_str().unwrap());
+    let df = LazyFrame::scan_parquet(plpath, Default::default())
+        .unwrap()
+        .select([col(content_key)])
+        .collect()
+        .unwrap();
+
+    let lines = df.column(content_key).unwrap().str().unwrap();
+
     // let mut buffer = Vec::new();
     // data.read_to_end(&mut buffer).unwrap();
     // println!("READ DATA {:?}", buffer);
@@ -409,22 +410,10 @@ fn process_path(
     let path_id = IntValueEnum::new(path_id, path_size);
 
     let mut docs_hashed = 0;
-    for (line_num, line) in data.lines().enumerate() {
-        let line = line.unwrap();
-        let json_obj: Value = serde_json::from_str(&line).expect(&format!(
-            "Failed to parse {:?} {:?}",
-            path.clone(),
-            line_num
-        ));
+    for (line_num, line) in lines.into_iter().enumerate() {
+        let text = line.unwrap();
         let line_num = IntValueEnum::new(line_num, line_size);
-        let text = json_obj
-            .get(content_key)
-            .unwrap()
-            .as_str()
-            .unwrap()
-            .to_string();
-
-        let Ok(tokens) = catch_unwind(|| preprocess_text(&text, &tokenizer)) else {
+        let Ok(tokens) = catch_unwind(|| preprocess_text(text, &tokenizer)) else {
             println!(
                 "Tokenization failed on {:?} | {:?} | {:?}",
                 path.clone(),
@@ -1221,11 +1210,11 @@ fn clean_path(
     input_dir: &PathBuf,
     output_dir: &PathBuf,
     annotate: bool,
-    annotate_key: &String,
+    // Unused as we now have separate cols
+    _annotate_key: &String,
     do_remove: bool,
 ) -> Result<(usize, usize), Error> {
     let output_filename = get_output_filename(input_path, input_dir, output_dir).unwrap();
-    let contents = read_pathbuf_to_mem(input_path).unwrap();
 
     // Line_num -> (cc_id, cc_size, cc_idx)
     let anno_lookup: HashMap<usize, (usize, usize, usize)> = line_data
@@ -1233,47 +1222,69 @@ fn clean_path(
         .map(|(a, b, c, d)| (a, (b, c, d)))
         .collect();
 
+    let plpath = PlPath::from_str(input_path.to_str().expect("failed to create path"));
+    let df = LazyFrame::scan_parquet(plpath, Default::default())
+        .unwrap()
+        .collect()
+        .expect("failed to read dataframe");
+
+    let nrows = df.shape().0;
+    let mut duplicated = vec![false; nrows];
+
+    // Annotations
+    let mut cc_idxs = Vec::new();
+    let mut cc_ids = Vec::new();
+    let mut cc_sizes = Vec::new();
+
     //let mut concat_kill: HashMap<Vec<String>, (usize, usize, usize)> = HashMap::new();
     let mut lines_seen = 0;
     let mut lines_removed = 0;
 
-    fn get_anno_value(val: (usize, usize, usize)) -> JSONValue {
-        json!({"cc_id": val.0,
-               "cc_size": val.1,
-               "cc_idx": val.2})
-    }
-    let mut writer = create_writer(&output_filename).unwrap();
-    for (line_num, line) in contents.lines().enumerate() {
+    //let mut writer = create_writer(&output_filename).unwrap();
+    for line_num in 0..nrows {
         lines_seen += 1;
-        let line = line?;
         if anno_lookup.contains_key(&line_num) {
             // Need to either annotate and write or just remove
             let (cc_id, cc_size, cc_idx) = *anno_lookup.get(&line_num).unwrap();
             if cc_idx > 0 {
                 lines_removed += 1;
+                duplicated[line_num] = true;
             }
             // Remove if not the first idx
             if cc_idx > 0 && do_remove {
                 continue;
             }
-
-            if annotate {
-                // If we want to annotate, go ahead and do that
-                let mut line_json: JSONValue = serde_json::from_str(&line).unwrap();
-                let anno_value = get_anno_value((cc_id, cc_size, cc_idx));
-                json_set(&mut line_json, &annotate_key.clone(), anno_value).unwrap();
-                writer
-                    .write_line(&serde_json::to_vec(&line_json).unwrap())
-                    .unwrap();
-            } else {
-                // Otherwise just write the line
-                writer.write_line(&line.as_bytes().to_vec()).unwrap();
-            }
-        } else {
-            // Not found in minhash, is "unique" and gets to survive
-            writer.write_line(&line.as_bytes().to_vec()).unwrap();
+            cc_ids.push(cc_id as u64);
+            cc_sizes.push(cc_size as u64);
+            cc_idxs.push(cc_idx as u64);
         }
     }
+    let duplicate_col = Series::new("duplicated".into(), &duplicated);
+    let mut lf = df.lazy().with_column(lit(duplicate_col));
+
+    if annotate {
+        let cc_id_col = Series::new("cc_id".into(), cc_ids);
+        let cc_size_col = Series::new("cc_size".into(), cc_sizes);
+        let cc_idx_col = Series::new("cc_idx".into(), cc_idxs);
+        lf = lf
+            .with_column(lit(cc_id_col))
+            .with_column(lit(cc_size_col))
+            .with_column(lit(cc_idx_col));
+    }
+
+    if do_remove {
+        lf = lf.filter(col("duplicated").not());
+    }
+
+    let mut df = lf.collect().expect("failed to gather lazy frame");
+    if let Some(parent_dir) = output_filename.parent() {
+        fs::create_dir_all(parent_dir).expect("failed to create parent folder");
+    }
+
+    let mut file = fs::File::create(&output_filename).expect("failed to create file.");
+    ParquetWriter::new(&mut file)
+        .finish(&mut df)
+        .expect("failed to write parquet");
 
     Ok((lines_seen, lines_removed))
 }
