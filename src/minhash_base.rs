@@ -267,11 +267,8 @@ fn load_domyn_edge_tokenizer(path: &str) -> Result<CoreBPE> {
     special_tokens.insert(String::from("</think>"), 115267);
     special_tokens.insert(String::from("<|pad|>"), 115268);
 
-    let bpe = CoreBPE::new(
-        encoder,
-        special_tokens,
-        "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+",
-    )?;
+    let gpt4_pat = "'(?i:[sdmt]|ll|ve|re)|[^\\r\\n\\p{L}\\p{N}]?+\\p{L}++|\\p{N}{1,3}+| ?[^\\s\\p{L}\\p{N}]++[\\r\\n]*+|\\s++$|\\s*[\\r\\n]|\\s+(?!\\S)|\\s";
+    let bpe = CoreBPE::new(encoder, special_tokens, gpt4_pat)?;
     Ok(bpe)
 }
 
