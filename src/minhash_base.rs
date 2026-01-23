@@ -21,6 +21,7 @@
 use crate::minhash_config::Config;
 use crate::storage::GenWriter;
 use crate::storage::{compute_sig_size, to_byte_size, IntValueEnum, SignatureWriter};
+use crate::tasks::get_task;
 use crate::uf_rush2::{parent as uf_parent, UFRush};
 use ahash::RandomState;
 use anyhow::{Error, Result};
@@ -426,13 +427,8 @@ fn process_path(
     sig_size: usize,
     content_key: &str,
 ) -> Result<usize, Error> {
-    let plpath = PlPath::from_str(path.to_str().unwrap());
-    let df = LazyFrame::scan_parquet(plpath, Default::default())
-        .unwrap()
-        .select([col(content_key)])
-        .collect()
-        .unwrap();
-
+    let task = get_task(path);
+    let df = task.load_text(path, content_key);
     let lines = df.column(content_key).unwrap().str().unwrap();
 
     // let mut buffer = Vec::new();
@@ -1259,11 +1255,8 @@ fn clean_path(
         .map(|(a, b, c, d)| (a, (b, c, d)))
         .collect();
 
-    let plpath = PlPath::from_str(input_path.to_str().expect("failed to create path"));
-    let df = LazyFrame::scan_parquet(plpath, Default::default())
-        .unwrap()
-        .collect()
-        .expect("failed to read dataframe");
+    let task = get_task(input_path);
+    let df = task.load(input_path);
 
     let nrows = df.shape().0;
     let mut duplicated = vec![false; nrows];
@@ -1318,11 +1311,7 @@ fn clean_path(
         fs::create_dir_all(parent_dir).expect("failed to create parent folder");
     }
 
-    let mut file = fs::File::create(&output_filename).expect("failed to create file.");
-    ParquetWriter::new(&mut file)
-        .finish(&mut df)
-        .expect("failed to write parquet");
-
+    task.save(&mut df, &output_filename);
     Ok((lines_seen, lines_removed))
 }
 

@@ -108,6 +108,7 @@ pub mod minhash_config;
 pub mod minhash_disk;
 pub mod minhash_memory;
 pub mod storage;
+pub mod tasks;
 pub mod true_jaccard;
 pub mod uf_rush2;
 pub mod utils;
