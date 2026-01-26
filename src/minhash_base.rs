@@ -1168,6 +1168,12 @@ pub fn clean_files(
     num_path_chunks: usize,
 ) -> Result<(), Error> {
     println!("Starting UF-based pruning...");
+
+    rayon::ThreadPoolBuilder::new()
+        .stack_size(20 * 1024 * 1024) // 20MB
+        .build_global()
+        .expect("Failed to set a higher stack size");
+
     let start_main = Instant::now();
     let output_config_obj = &config_obj.output_params;
 
