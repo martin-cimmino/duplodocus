@@ -427,6 +427,7 @@ fn process_path(
     sig_size: usize,
     content_key: &str,
 ) -> Result<usize, Error> {
+    println!("Processing path {}", path.display());
     let task = get_task(path);
     let df = task.load_text(path, content_key);
     let lines = df.column(content_key).unwrap().str().unwrap();
