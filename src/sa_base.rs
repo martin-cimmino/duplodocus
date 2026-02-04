@@ -540,7 +540,7 @@ fn get_matches_parallel_typed<T: CompactUint>(
                 })
         });
     let random_pbar_thread = rand::thread_rng().gen_range(0..thread_iters.len());        
-    let thread_pbar = build_pbar(text_lookup.len(), "Jobs");
+    let thread_pbar = build_pbar(thread_iters.len(), "Jobs");
 
     // And set up the matches writers
     // Finally we can do the parallel merge thing:
