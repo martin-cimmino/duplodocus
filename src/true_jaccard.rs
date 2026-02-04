@@ -120,7 +120,6 @@ pub fn true_jaccard(
                 &output_counter,
                 &new_cc_counter,
                 &delete_while_cleaning,
-                input_dir,
             )
             .unwrap();
             total_count.fetch_add(group_total, Ordering::SeqCst);
@@ -162,7 +161,6 @@ fn true_jacc_group(
     output_counter: &AtomicUsize,
     new_cc_counter: &AtomicUsize,
     delete_while_cleaning: &bool,
-    input_dir: &PathBuf,
 ) -> Result<(usize, usize, usize), Error> {
     // Handles a group of files to filter for jaccard similarity between all pairs that share a 'minhash' (or all, if none have)
 
@@ -185,7 +183,7 @@ fn true_jacc_group(
         .collect();
     if *delete_while_cleaning {
         pvec.par_iter().for_each(|p| {
-            fs::remove_file(&input_dir.clone().join(p)).unwrap();
+            fs::remove_file(&p).unwrap();
         });
     }
     let n = all_docs.len();
@@ -203,7 +201,7 @@ fn true_jacc_group(
             } else {
                 // If specified, just ignore these docs (but make sure they get written)
                 let mut output_guard = output_docs.lock().unwrap();
-                output_guard.push(v);
+                output_guard.push((None, v));
             }
         });
     } else {
@@ -231,7 +229,7 @@ fn true_jacc_group(
         .map(|(_k, v)| v)
         .partition(|v| v.len() >= hotnode_size);
     let hotnode_count = hotnodes.iter().map(|v| v.len()).sum();
-    let hotnode_docs: Vec<JSONValue> = hotnodes.into_par_iter().flat_map_iter(|v| v).collect();
+    let hotnode_docs: Vec<(Option<usize>, JSONValue)> = hotnodes.into_par_iter().flat_map_iter(|v| v.into_iter().map(|el| (None, el))).collect();
     write_docs(hotnode_docs, hotnode_counter, hotnode_dir, "hotnode").unwrap();
 
     // Step 3: Make token-ngram sets, gather indices to check, and check jaccard similarities
@@ -244,7 +242,9 @@ fn true_jacc_group(
         .filter(|(g, i, j)| {
             let hashset_i = &toksets[*g][*i];
             let hashset_j = &toksets[*g][*j];
-            let (hashset_i, hashset_j) = if hashset_i.len() < hashset_j.len() {
+
+            // swap so |hashset_i| <= |hashset_j|
+            let (hashset_i, hashset_j) = if hashset_i.len() <= hashset_j.len() {
                 (hashset_i, hashset_j)
             } else {
                 (hashset_j, hashset_i)
@@ -379,7 +379,7 @@ fn par_annotate(
     cc_id_lookup: DashMap<usize, usize>,
     uf: &UFRush,
     annotate_key: &String,
-) -> Result<(Vec<JSONValue>, usize), Error> {
+) -> Result<(Vec<(Option<usize>, JSONValue)>, usize), Error> {
     // Pairs are like [(uf_index/id, doc), ...]
     let flat_with_indices: Vec<(usize, JSONValue)> = docs
         .into_par_iter()
@@ -444,11 +444,11 @@ fn par_annotate(
         });
 
     let remove_count = AtomicUsize::new(0);
-    let new_docs: Vec<JSONValue> = flat_with_indices
+    let mut annotated_docs: Vec<(Option<usize>, JSONValue)> = flat_with_indices
         .into_par_iter()
         .enumerate()
         .map(|(doc_idx, (_, mut obj))| {
-            if let Some(parent) = parent_lookup[doc_idx] {
+            let cc_id_opt = if let Some(parent) = parent_lookup[doc_idx] {
                 let cc_id = *cc_id_lookup.get(&parent).unwrap();
                 let cc_size = *cc_size.get(&parent).unwrap();
                 let cc_idx = *cc_idx_array.get(&doc_idx).unwrap();
@@ -461,57 +461,73 @@ fn par_annotate(
                     json!({"cc_id": cc_id, "cc_size": cc_size, "cc_idx": cc_idx}),
                 )
                 .unwrap();
-            }
-            obj
+                Some(cc_id)
+            } else {
+                None
+            };
+            (cc_id_opt, obj)
         })
         .collect();
-    Ok((new_docs, remove_count.into_inner()))
+
+    annotated_docs.par_sort_by_key(|(cc_id_opt, _)| *cc_id_opt);
+
+    Ok((annotated_docs, remove_count.into_inner()))
 }
 
 fn write_docs(
-    docs: Vec<JSONValue>,
+    docs: Vec<(Option<usize>, JSONValue)>,
     counter: &AtomicUsize,
     output_dir: &PathBuf,
     prefix: &str,
 ) -> Result<(), Error> {
     // Parallel: Serialize all docs
-    let serialized: Vec<Vec<u8>> = docs
+    let serialized: Vec<(Option<usize>, Vec<u8>)> = docs
         .into_par_iter()
-        .map(|doc| {
+        .enumerate()
+        .map(|(_idx, (cc_id_opt, doc))| {
             let mut bytes = serde_json::to_vec(&doc).unwrap();
             bytes.push(b'\n');
-            bytes
+            (cc_id_opt, bytes)
         })
         .collect();
 
-    // Parallel: Group into chunks (just indices)
+    // Sequential: Group into chunks respecting cc_id boundaries
     let mut idx_groups: Vec<Vec<usize>> = Vec::new();
-
     let mut cur_group: Vec<usize> = Vec::new();
     let mut cur_size = 0;
-    for (i, v) in serialized.iter().enumerate() {
-        let len = v.len();
-        cur_group.push(i);
-        cur_size += len;
-        if cur_size >= OUTPUT_FILE_SIZE {
+    let mut current_cc_id: Option<usize> = None;
+
+    for (i, (cc_id_opt, bytes)) in serialized.iter().enumerate() {
+        let len = bytes.len();
+        
+        let cc_changed = (*cc_id_opt == None) || (*cc_id_opt != current_cc_id);
+
+        // Start a new file if we exceed size AND cc_id changed
+        if !cur_group.is_empty() && cc_changed && cur_size + len > OUTPUT_FILE_SIZE {
             idx_groups.push(std::mem::take(&mut cur_group));
             cur_size = 0;
         }
+        
+        cur_group.push(i);
+        cur_size += len;
+        current_cc_id = *cc_id_opt;
     }
-    if cur_group.len() > 0 {
-        idx_groups.push(cur_group)
+    
+    if !cur_group.is_empty() {
+        idx_groups.push(cur_group);
     }
 
+    // Parallel: Write each group to a file
     idx_groups.into_par_iter().for_each(|group| {
         let output_file = output_dir.clone().join(format!(
             "{}_file_{:08}.jsonl.zst",
             prefix,
             counter.fetch_add(1, Ordering::SeqCst)
         ));
-        let total_size: usize = group.iter().map(|&i| serialized[i].len()).sum();
+        let total_size: usize = group.iter().map(|&i| serialized[i].1.len()).sum();
         let mut contents = Vec::with_capacity(total_size);
         for &i in &group {
-            contents.extend_from_slice(&serialized[i]);
+            contents.extend_from_slice(&serialized[i].1);
         }
         write_mem_to_pathbuf(&contents, &output_file).unwrap();
     });
@@ -520,6 +536,10 @@ fn write_docs(
 }
 
 fn generate_pair_indices<T>(data: &Vec<Vec<T>>) -> Vec<(usize, usize, usize)> {
+    // Generates index "pairs" that should be checked.
+    // I.e., if we have input list like [[A, B, C], [D, E]]
+    // this should return [(0, 0, 1), (0, 0, 2), (0, 1, 2), (1, 0, 1)]
+    //  --->                 (A,B)       (A, C)    (B, C)      (D, E)
     data.iter()
         .enumerate()
         .flat_map(|(vec_idx, inner)| {
