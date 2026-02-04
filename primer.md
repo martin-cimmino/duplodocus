@@ -42,7 +42,7 @@ $$
 
 A standard way to amplify this would be to use multiple independent hash functions, and then report a minhash-collision only if all minhash signatures are equal. The probability that this occurs would be $J(A,B)^k$, which sharpens the curve, but also "pushes it to the right". To allow more control over the threshold, one consider minhashing in a 2-dimensional way. Suppose we have $m \times k$ independent hash functions. For any set, we can generate a signature for each of these hash functions, which we arrange in an $m \times k$ matrix, yielding a "signature matrix" for each set. We can say that any two sets have a minhash collision if for any $j \leq m$, the $j^{th}$ rows of their signature matrices are equal. Any one row is equal with probability $J(A,B)^k$, and the probability that at least one row of the $m$ rows is equal is 
 
-$$P[\text{collision}] = 1 - (1-J(A,B)^k)^m.$$ 
+$$P[\text{collision}] = 1 - (1-J(A,B)^k)^m.$$
 
 Intuitively, this makes the curve less sharp while also shifting it slightly to the left. 
 
