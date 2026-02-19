@@ -115,7 +115,6 @@ pub fn make_sa_tables_cmd(
             .unwrap();
         file_map
     };
-
     let config_overrides = SAConfigOverrides {
         tokenizer: tokenizer,
         max_lines_per_path: max_lines_per_path,
@@ -270,6 +269,7 @@ pub fn load_data_docs(
     local_input: &PathBuf,
 ) -> Result<Vec<(usize, usize, String)>, Error> {
     let text_key = config.text_key.clone();
+    println!("FM IDX {:?}", file_map.indices);
     let mut extant_idxs: Vec<(&PathBuf, &usize)> = file_map
         .indices
         .par_iter()
@@ -876,14 +876,16 @@ pub fn gather_match_writer_elements(node_buffer: &Vec<TreeNode>, lcp: &Vec<u64>,
         };
         (node_buffer[i].prev_char, match_el)
     }).collect();
-
+    // return Ok(match_writer_els.into_iter().map(|(opt, el)| el).collect());
     let mut counts: HashMap<u8, usize> = HashMap::new();
     for (opt, _) in &match_writer_els {
         if let Some(v) = opt {
             *counts.entry(*v).or_insert(0) += 1;
         }
     }
-
+    println!("LCP MAX {:?}", lcp_maxs);
+    println!("COUNTS {:?}", counts);
+    println!("MATCHES, {:?}", match_writer_els);
     let filtered: Vec<MatchWriterElement> = match_writer_els
         .into_iter()
         .filter_map(|(opt, el)| match opt {
@@ -896,7 +898,7 @@ pub fn gather_match_writer_elements(node_buffer: &Vec<TreeNode>, lcp: &Vec<u64>,
                 }
             }
         }).collect();
-
+    println!("FILTERED, {:?}", filtered);
     Ok(filtered)
 
 

@@ -372,6 +372,7 @@ impl<'a, T: CompactUint> Iterator for SAStream<'a, T> {
 =                           MATCH WRITER THING                       =
 ====================================================================*/
 
+#[derive(Debug)]
 pub struct MatchWriterElement {
     pub source: usize,
     pub part_num: u64,
