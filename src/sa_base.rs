@@ -824,7 +824,6 @@ fn get_matches_parallel_thread<'a, T: CompactUint>(
 
             // If long enough, gather and write the elements
             if cur_buffer.len() >= rep_count {
-                let node_bos: Vec<(u64, u64)> = cur_buffer.iter().map(|node| (node.sa_value, node.prev_bos().unwrap())).collect();
                 let match_els = gather_match_writer_elements(&cur_buffer, &lcp_array, rep_count, part_num64).unwrap();
                 for el in match_els {
                     match_writer.write_element(el).unwrap();
