@@ -824,6 +824,7 @@ fn get_matches_parallel_thread<'a, T: CompactUint>(
 
             // If long enough, gather and write the elements
             if cur_buffer.len() >= rep_count {
+                let node_bos: Vec<(u64, u64)> = cur_buffer.iter().map(|node| (node.sa_value, node.prev_bos().unwrap())).collect();
                 let match_els = gather_match_writer_elements(&cur_buffer, &lcp_array, rep_count, part_num64).unwrap();
                 for el in match_els {
                     match_writer.write_element(el).unwrap();
@@ -874,7 +875,12 @@ pub fn gather_match_writer_elements(node_buffer: &Vec<TreeNode>, lcp: &Vec<u64>,
             lcp: lcp_maxs[i],
             first_run_el: (i == 0)
         };
-        (node_buffer[i].prev_char, match_el)
+        let prev_char: Option<u8> = if node.prev_bos().unwrap() == node.sa_value {
+            None
+        } else {
+            node.prev_char
+        };
+        (prev_char, match_el)
     }).collect();
     // return Ok(match_writer_els.into_iter().map(|(opt, el)| el).collect());
     let mut counts: HashMap<u8, usize> = HashMap::new();
@@ -883,9 +889,6 @@ pub fn gather_match_writer_elements(node_buffer: &Vec<TreeNode>, lcp: &Vec<u64>,
             *counts.entry(*v).or_insert(0) += 1;
         }
     }
-    println!("LCP MAX {:?}", lcp_maxs);
-    println!("COUNTS {:?}", counts);
-    println!("MATCHES, {:?}", match_writer_els);
     let filtered: Vec<MatchWriterElement> = match_writer_els
         .into_iter()
         .filter_map(|(opt, el)| match opt {
@@ -898,7 +901,6 @@ pub fn gather_match_writer_elements(node_buffer: &Vec<TreeNode>, lcp: &Vec<u64>,
                 }
             }
         }).collect();
-    println!("FILTERED, {:?}", filtered);
     Ok(filtered)
 
 

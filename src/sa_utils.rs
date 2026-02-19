@@ -311,6 +311,27 @@ impl<'a, T: CompactUint> SAStream<'a, T> {
         Ok(*offset.get(left * 3+ 2).unwrap())        
     }
 
+    pub fn prev_eos(&self, idx: usize) -> Result<u64, Error> {
+        let offset: &[u64] = self.offset;
+        // Binary search for the last element <= idx
+        let mut left = 0;
+        let mut right = offset.len() / 3;
+
+        while left < right {
+            let mid = left + (right - left) / 2;
+
+            if offset[mid * 3 + 2] < idx as u64 {
+                // Element at mid could be the answer, search right half
+                left = mid + 1;
+            } else {
+                // Element at mid is too large, search left half
+                right = mid;
+            }
+        }
+        // `left` is now the first element > idx, so we want left - 1
+        Ok(*offset.get(left.saturating_sub(1) * 3 + 2).unwrap())
+    }    
+
 }
 
 
@@ -343,20 +364,22 @@ impl<'a, T: CompactUint> Iterator for SAStream<'a, T> {
             let slice_end = next_idx + self.min_len;
             let slice = &self.text[next_idx..slice_end];
             let rest_of_doc = &self.text[slice_end..next_eos];
+
+
             let prev_char: Option<u8> = if next_idx > 0 {
                 self.text.get(next_idx - 1).copied()
             } else {
                 None
             };
         
-
             let tree_output = Some(TreeNode {
                 sa_idx: (self.next_call_counter - 1usize) as u64,
                 sa_value: next_idx_val.to_u64(),
                 cmp_bytes: slice,
                 source: self.source,
                 prev_char, 
-                rest_of_doc                    
+                rest_of_doc,
+                offset: self.offset,                
             });
 
             return Some(Ok((loop_counter, tree_output)));    
@@ -505,7 +528,8 @@ pub struct TreeNode<'a> {
     pub cmp_bytes: &'a [u8], // first min_len bytes of the text pointed to by sa_value
     pub source: usize,       // which input stream this came from
     pub prev_char: Option<u8>,     // the byte that occurs BEFORE this one in the stream (if it exists)
-    pub rest_of_doc: &'a [u8] // rest of the document (continuation of cmp_bytes)
+    pub rest_of_doc: &'a [u8], // rest of the document (continuation of cmp_bytes)
+    pub offset: &'a [u64],
 }
 impl TreeNode<'_> {
 	pub fn prev_char_same(&self, other: &TreeNode)  -> bool {
@@ -558,6 +582,28 @@ impl <'a> TreeNode<'a> {
             .take_while(|(x, y)| x == y)
             .count()) as u64
     }
+
+    pub fn prev_bos(&self) -> Result<u64, Error> {
+        let offset: &[u64] = self.offset;
+        // Binary search for the last element <= idx
+        let mut left = 0;
+        let mut right = offset.len() / 3;
+        let search_idx = (self.sa_value + 1) as u64;
+        while left < right {
+            let mid = left + (right - left) / 2;
+
+            if offset[mid * 3 + 2] < search_idx {
+                // Element at mid could be the answer, search right half
+                left = mid + 1;
+            } else {
+                // Element at mid is too large, search left half
+                right = mid;
+            }
+        }
+        // `left` is now the first element > idx, so we want left - 1
+        Ok(*offset.get(left.saturating_sub(1) * 3 + 2).unwrap())
+    }
+
 }
 
 
