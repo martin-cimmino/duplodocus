@@ -1,3 +1,4 @@
+use ahash::HashMapExt;
 use std::sync::Arc;
 use std::sync::Mutex;
 use crate::compact_uint::{CompactUint, U40};
@@ -19,7 +20,7 @@ use std::io::SeekFrom;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
-
+use std::collections::VecDeque;
 
 //use crate::table_old::SuffixTable;
 use crate::table_generic::DynamicSuffixTable;
@@ -34,7 +35,7 @@ use std::path::PathBuf;
 
 use std::cmp::Ordering as StdOrdering;
 
-use crate::sa_utils::{SAStream, MatchWriter, MatchWriterElement, LoserTree, read_u64_vec, get_byte_size, MmapRangeReader, adaptive_batch_size};
+use crate::sa_utils::{SAStream, MatchWriter, MatchWriterElement, LoserTree, read_u64_vec, get_byte_size, MmapRangeReader, adaptive_batch_size, TreeNode};
 use crate::sa_config::{SAConfigOverrides, SAConfig};
 /*
 
@@ -344,7 +345,7 @@ fn chunk_data_for_sa(
 =                            PQ LOOPS                        =
 ============================================================*/
 
-pub fn get_matches_serial(storage_dir: &PathBuf, match_length: usize) -> Result<(), Error> {
+pub fn get_matches_serial(storage_dir: &PathBuf, match_length: usize, rep_count: usize) -> Result<(), Error> {
     /* Step 1:
     Load into memory:
         - file map
@@ -358,9 +359,9 @@ pub fn get_matches_serial(storage_dir: &PathBuf, match_length: usize) -> Result<
     let element_size: usize = text_lookup.iter().map(|v| get_byte_size(v.len())).max().unwrap();
 
     let match_count = match element_size {
-        4 => get_matches_serial_typed::<u32>(storage_dir, &text_lookup, match_length).unwrap(),
-        5 => get_matches_serial_typed::<U40>(storage_dir, &text_lookup, match_length).unwrap(),
-        8 => get_matches_serial_typed::<u64>(storage_dir, &text_lookup, match_length).unwrap(),
+        4 => get_matches_serial_typed::<u32>(storage_dir, &text_lookup, match_length, rep_count).unwrap(),
+        5 => get_matches_serial_typed::<U40>(storage_dir, &text_lookup, match_length, rep_count).unwrap(),
+        8 => get_matches_serial_typed::<u64>(storage_dir, &text_lookup, match_length, rep_count).unwrap(),
         _ => panic!("Unsupported element size: {}", element_size)
     };
     
@@ -377,13 +378,14 @@ pub fn get_matches_serial_typed<T: CompactUint>(
     storage_dir: &PathBuf,
     text_lookup: &Vec<Vec<u8>>,    
     match_length: usize,
+    rep_count: usize,
     )
 -> Result<usize, Error> {
     let match_writer = MatchWriter::new(&storage_dir.clone().join("matches")).unwrap();    
     let offset_lookup = make_offset_lookups(storage_dir).unwrap();    
     let table_streams = make_table_streams::<T>(storage_dir, &text_lookup, &offset_lookup, match_length).unwrap();    
     let mut stream_map: HashMap<usize, SAStream<T>> = table_streams.into_iter().enumerate().map(|(i, stream)| (i, stream)).collect();    
-    let num_matches = get_matches_parallel_thread::<T>(&mut stream_map, &match_writer, match_length, true, 0).unwrap();
+    let num_matches = get_matches_parallel_thread::<T>(&mut stream_map, &match_writer, match_length, true, 0, rep_count).unwrap();
     match_writer.finish().unwrap();
     Ok(num_matches)
 }
@@ -478,7 +480,7 @@ fn make_table_streams<'stream, 'a, T: CompactUint>(
     Ok(table_streams)
 }
 
-pub fn get_matches_parallel(storage_dir: &PathBuf, match_length: usize) -> Result<(), Error> {
+pub fn get_matches_parallel(storage_dir: &PathBuf, match_length: usize, rep_count: usize) -> Result<(), Error> {
     /* Paralellism strategy : Paralellize across alphabet (based on statistics from one )
     1. Load all texts into memory
     2. Pick one suffix table and scan through it to get some reference suffices to serve as waypoints.
@@ -495,9 +497,9 @@ pub fn get_matches_parallel(storage_dir: &PathBuf, match_length: usize) -> Resul
     let sa_element_size = text_lookup.iter().map(|v| get_byte_size(v.len())).max().unwrap();
 
     match sa_element_size {
-        4 => get_matches_parallel_typed::<u32>(storage_dir, match_length, text_lookup).unwrap(),
-        5 => get_matches_parallel_typed::<U40>(storage_dir, match_length, text_lookup).unwrap(),
-        8 => get_matches_parallel_typed::<u64>(storage_dir, match_length, text_lookup).unwrap(),
+        4 => get_matches_parallel_typed::<u32>(storage_dir, match_length, text_lookup, rep_count).unwrap(),
+        5 => get_matches_parallel_typed::<U40>(storage_dir, match_length, text_lookup, rep_count).unwrap(),
+        8 => get_matches_parallel_typed::<u64>(storage_dir, match_length, text_lookup, rep_count).unwrap(),
         _ => panic!("Unsupported element size {}", sa_element_size)
     }
 
@@ -509,6 +511,7 @@ fn get_matches_parallel_typed<T: CompactUint>(
     storage_dir: &PathBuf,
     match_length: usize,
     text_lookup: Vec<Vec<u8>>,    
+    rep_count: usize,
 ) -> Result<(), Error> {
 
     let thread_count = rayon::current_num_threads();
@@ -547,7 +550,7 @@ fn get_matches_parallel_typed<T: CompactUint>(
     println!("Starting parallel match-finding...");
 
     thread_iters.par_iter_mut().enumerate().for_each(|(part_num, streams)| {
-        get_matches_parallel_thread::<T>(streams, &match_writer, match_length, part_num==random_pbar_thread, part_num).unwrap();
+        get_matches_parallel_thread::<T>(streams, &match_writer, match_length, part_num==random_pbar_thread, part_num, rep_count).unwrap();
         thread_pbar.inc(1);
     });     
     match_writer.finish().unwrap();
@@ -779,6 +782,7 @@ fn get_matches_parallel_thread<'a, T: CompactUint>(
     match_length: usize,
     use_pbar: bool,
     part_num: usize,
+    rep_count: usize,
 ) -> Result<usize, Error> {
 
     // Build pbar if requested
@@ -801,83 +805,183 @@ fn get_matches_parallel_thread<'a, T: CompactUint>(
     if prev_min == None {
         return Ok(match_count);
     }
-    let mut prev_min = prev_min.unwrap();
-    let mut prev_lcp: Option<u64> = None;
-    let mut currently_in_a_run = false;
-    let mut prev_char_same = false;
-    /* Loop through LoserTree 
-    Steps: 
-        1. Get the top value and if it shares match_length bytes w/ the last popped el, proceed to step 2. O/w loop.
-        2a. If "not in a run", then the stashed "prev" needs to be written with all data and _current_ LCP 
-        2b. IF "yes in a run", the check if _current_ LCP is > the prev LCP
-    */
+
+
+
+
+    let prev_min = prev_min.unwrap();
+    let mut cur_buffer: Vec<TreeNode>= vec![prev_min];
+    let mut lcp_array: Vec<u64> = Vec::new();
+
     while !loser_tree.peek().is_none() {
         let cur_min = loser_tree.pop_check().unwrap().unwrap();
-        if cur_min.cmp_eq(&prev_min) {// If top value shares match_length bytes w/ previously popped el...
-            let cur_lcp = cur_min.lcp(&prev_min, match_length);
-            prev_char_same = cur_min.prev_char_same(&prev_min);
-            if !prev_char_same { // If we would fully subsume this by some other thing
-                let lcp_to_write = if let Some(prev_lcp_val) = prev_lcp {
-                    prev_lcp_val.max(cur_lcp)
-                } else {
-                    cur_lcp
-                };
+        if cur_min.cmp_eq(cur_buffer.first().unwrap()) { // If top value shares match_length bytes w/ current run...
+            // Add to the buffer and augment the lcp array
+            lcp_array.push(cur_min.lcp(cur_buffer.last().unwrap(), match_length));
+            cur_buffer.push(cur_min);
 
-                let prev_write_element = MatchWriterElement {
-                    source: prev_min.source,
-                    part_num: part_num64,
-                    sa_idx: prev_min.sa_idx,
-                    sa_value: prev_min.sa_value,
-                    lcp: lcp_to_write,
-                    first_run_el: !currently_in_a_run
-                };
-                match_writer.write_element(prev_write_element).unwrap();
-                match_count += 1;
+        } else { // flush the buffer
+
+            // If long enough, gather and write the elements
+            if cur_buffer.len() >= rep_count {
+                let match_els = gather_match_writer_elements(&cur_buffer, &lcp_array, rep_count, part_num64).unwrap();
+                for el in match_els {
+                    match_writer.write_element(el).unwrap();
+                    match_count += 1;
+                }
             }
 
-            prev_lcp = Some(cur_lcp);
-            currently_in_a_run = true;
-        } else {
-            if currently_in_a_run && !prev_char_same {// If I'm ending a run, write the previous thing in 
-                let prev_write_element = MatchWriterElement {
-                    source: prev_min.source,
-                    part_num: part_num64,
-                    sa_idx: prev_min.sa_idx,
-                    sa_value: prev_min.sa_value,
-                    lcp: prev_lcp.unwrap(),
-                    first_run_el: false
-                };                
-                match_writer.write_element(prev_write_element).unwrap();
-                match_count += 1;
-            }
-            prev_lcp = None;
-            currently_in_a_run = false;            
-            //prev_char_same = false;
+            // No matter what, clear the buffer and add the current min
+            cur_buffer.clear();
+            cur_buffer.push(cur_min);
+            lcp_array.clear();        
+        }   
+    }
+
+    // Handle the final case if we are still in a run
+    if cur_buffer.len() >= rep_count {
+        let match_els = gather_match_writer_elements(&cur_buffer, &lcp_array, rep_count, part_num64).unwrap();
+        for el in match_els {
+            match_writer.write_element(el).unwrap();
+            match_count += 1;
         }
-        prev_min = cur_min;
     }
-
-    if currently_in_a_run && !prev_char_same {
-        let prev_write_element = MatchWriterElement {
-            source: prev_min.source,
-            part_num: part_num64,
-            sa_idx: prev_min.sa_idx,
-            sa_value: prev_min.sa_value,
-            lcp: prev_lcp.unwrap(),
-            first_run_el: false
-        };                
-        match_writer.write_element(prev_write_element).unwrap();        
-        match_count += 1;
-
-    }
-
 
     Ok(match_count)
 }
 
 
 
+pub fn gather_match_writer_elements(node_buffer: &Vec<TreeNode>, lcp: &Vec<u64>, rep_count: usize, part_num64: u64) -> Result<Vec<MatchWriterElement>, Error> {
+    // Get LCP windows:
+    // For an element in my NodeBuffer
+    let window_min: Vec<u64> = sliding_window_min(lcp, rep_count).unwrap();
+    let padded_window_min: Vec<u64> = std::iter::repeat(0u64)
+        .take(rep_count - 1)
+        .chain(window_min.iter().copied())
+        .chain(std::iter::repeat(0u64).take(rep_count-1))
+        .collect();
 
+    let lcp_maxs = sliding_window_max(&padded_window_min, rep_count).unwrap();
+
+    let match_writer_els: Vec<(Option<u8>, MatchWriterElement)> = (0..node_buffer.len()).map(|i| {
+        let node = &node_buffer[i];
+        let match_el = MatchWriterElement {
+            source: node.source,
+            part_num: part_num64,
+            sa_idx: node.sa_idx,
+            sa_value: node.sa_value,
+            lcp: lcp_maxs[i],
+            first_run_el: (i == 0)
+        };
+        (node_buffer[i].prev_char, match_el)
+    }).collect();
+
+    let mut counts: HashMap<u8, usize> = HashMap::new();
+    for (opt, _) in &match_writer_els {
+        if let Some(v) = opt {
+            *counts.entry(*v).or_insert(0) += 1;
+        }
+    }
+
+    let filtered: Vec<MatchWriterElement> = match_writer_els
+        .into_iter()
+        .filter_map(|(opt, el)| match opt {
+            None => Some(el),
+            Some(v) => {
+                if counts.get(&v).unwrap() < &rep_count {
+                    Some(el)
+                } else {
+                    None
+                }
+            }
+        }).collect();
+
+    Ok(filtered)
+
+
+}
+
+
+fn sliding_window_min(lcp: &Vec<u64>, k: usize) -> Result<Vec<u64>, Error> {
+    assert!(k >= 1);
+    let window = k - 1; // We want min over K-1 lcp values
+    if window == 0 || lcp.is_empty() {
+        return Ok(lcp.clone());
+    }
+
+    let num_windows = lcp.len().saturating_sub(window - 1);
+    let mut window_min = vec![0u64; num_windows];
+    let mut deque: VecDeque<usize> = VecDeque::new();
+
+    for j in 0..lcp.len() {
+        // Evict front elements that are outside the window
+        while let Some(&front) = deque.front() {
+            if j+1 > window && front < j + 1 - window {
+                deque.pop_front();
+            } else {
+                break;
+            };
+        }
+
+        // Maintain increasing order: evict back elements with lcp >= lcp[j]
+        while let Some(&back) = deque.back() {
+            if lcp[back] >= lcp[j] {
+                deque.pop_back();
+            } else {
+                break;
+            }
+        }
+
+        deque.push_back(j);
+        if j >= window - 1 {
+            let front_idx = *deque.front().unwrap();
+            window_min[j - (window - 1)] = lcp[front_idx];
+        }
+    }
+    Ok(window_min)
+
+}
+
+fn sliding_window_max(window_min: &Vec<u64>, k: usize) -> Result<Vec<u64>, Error> {
+    if window_min.is_empty() || k == 0 {
+        return Ok(window_min.clone());
+    }
+
+    let num_windows = window_min.len().saturating_sub(k - 1);
+    let mut best_lcp = vec![0u64; num_windows];
+    let mut deque: VecDeque<usize> = VecDeque::new();
+
+    for i in 0..window_min.len() {
+        // Evict front elements outside the window of size k
+        while let Some(&front) = deque.front() {
+            if i + 1 > k && front < i + 1 - k {
+                deque.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        // Maintain decreasing order: evict back elements with window_min <= window_min[i]
+        while let Some(&back) = deque.back() {
+            if window_min[back] <= window_min[i] {
+                deque.pop_back();
+            } else {
+                break;
+            }
+        }
+
+        deque.push_back(i);
+
+        // Once we have a full window, record the max
+        if i >= k - 1 {
+            let front_idx = *deque.front().unwrap();
+            best_lcp[i - (k - 1)] = window_min[front_idx];
+        }
+    }
+
+    Ok(best_lcp)
+}
 
 
 /*=====================================================================

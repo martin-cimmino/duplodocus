@@ -735,6 +735,9 @@ enum Commands {
 
         #[arg(long, default_value_t = 500)]
         match_length: usize,
+
+        #[arg(long, default_value_t=2)]
+        rep_count: usize
     },
 
     #[clap(arg_required_else_help = true)]
@@ -744,6 +747,9 @@ enum Commands {
 
         #[arg(long, default_value_t = 500)]
         match_length: usize,
+
+        #[arg(long, default_value_t=2)]
+        rep_count: usize        
     },    
 
     #[clap(arg_required_else_help = true)]
@@ -1010,12 +1016,14 @@ fn main() {
         Commands::SaGetMatchesSerial {
             storage_dir,
             match_length,
-        } => get_matches_serial(storage_dir, *match_length),
+            rep_count,
+        } => get_matches_serial(storage_dir, *match_length, *rep_count),
 
         Commands::SaGetMatchesParallel {
             storage_dir,
             match_length,
-        } => get_matches_parallel(storage_dir, *match_length),        
+            rep_count, 
+        } => get_matches_parallel(storage_dir, *match_length, *rep_count),        
 
         Commands::SaMergeMatches {
             storage_dir,            
