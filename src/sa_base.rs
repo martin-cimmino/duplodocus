@@ -269,7 +269,6 @@ pub fn load_data_docs(
     local_input: &PathBuf,
 ) -> Result<Vec<(usize, usize, String)>, Error> {
     let text_key = config.text_key.clone();
-    println!("FM IDX {:?}", file_map.indices);
     let mut extant_idxs: Vec<(&PathBuf, &usize)> = file_map
         .indices
         .par_iter()

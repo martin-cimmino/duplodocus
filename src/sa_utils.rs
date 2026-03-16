@@ -51,14 +51,14 @@ pub fn read_u64_vec(p: &PathBuf) -> Result<Vec<u64>, Error> {
 
 pub fn adaptive_batch_size(corpus_len: usize, safety_margin: f64) -> usize {
     /*Peak memory usage is roughly the sum of :
-       - text + incidentals : 1.25 * corpus_len 
+       - text + incidentals : 1.50 * corpus_len 
        - suffix_tables: corpus_len * T / B 
             where B is the number of batches and T is the size of each batch
             where T ~~ ceil(log_2(corpus_len / (num_threads * batch_size)))
             and B is decided adaptively here (but is an integer!)
     */
 
-    let text_memory = corpus_len as f64 * 1.25;
+    let text_memory = corpus_len as f64 * 1.50;
 
     let rayon_threads = rayon::current_num_threads() as f64;
     let mut sys = System::new_all();
