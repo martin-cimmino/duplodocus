@@ -99,6 +99,7 @@ use crate::minhash_disk::{
     mh_build_file_map, mh_build_uf, mh_clean_files, mh_gather_edges, mh_hash_docs,
 };
 use crate::minhash_memory::minhash_memory;
+use crate::sa_base::{get_matches_serial, make_sa_tables_cmd, merge_matches, sa_annotate_files, get_matches_parallel};
 use crate::true_jaccard::true_jaccard;
 
 pub mod exact_dedup_disk;
@@ -107,12 +108,19 @@ pub mod minhash_base;
 pub mod minhash_config;
 pub mod minhash_disk;
 pub mod minhash_memory;
+pub mod sa_base;
 pub mod storage;
 pub mod tasks;
 pub mod true_jaccard;
 pub mod uf_rush2;
 pub mod utils;
-
+// pub mod bitpack_vec;
+pub mod table_old;
+pub mod table_generic;
+pub mod sa_utils;
+pub mod sa_config;
+pub mod compact_uint;
+// pub mod table_new;
 /* 4 basic use cases here:
 {Exact, Fuzzy} x {Memory, Disk} deduplication:
 
@@ -694,6 +702,95 @@ enum Commands {
         #[arg(long)]
         delete_while_cleaning: Option<bool>,
     },
+    #[clap(arg_required_else_help = true)]
+    SaMakeTables {
+        #[arg(required = true, long)]
+        input_dir: PathBuf,
+
+        #[arg(required = true, long)]
+        output_dir: PathBuf,
+
+        #[arg(long)]
+        config: Option<PathBuf>,
+
+        #[arg(long)]
+        file_map: Option<PathBuf>,
+
+        #[arg(long)]
+        tokenizer: Option<String>,
+
+        #[arg(long)]
+        max_lines_per_path: Option<usize>,
+
+        #[arg(long)]
+        text_key: Option<String>,
+
+        #[arg(long, default_value_t=1.0)]
+        batch_size: f32,
+    },
+
+    #[clap(arg_required_else_help = true)]
+    SaGetMatchesSerial {
+        #[arg(required = true, long)]
+        storage_dir: PathBuf,
+
+        #[arg(long, default_value_t = 500)]
+        match_length: usize,
+
+        #[arg(long, default_value_t=2)]
+        rep_count: usize
+    },
+
+    #[clap(arg_required_else_help = true)]
+    SaGetMatchesParallel {
+        #[arg(required = true, long)]
+        storage_dir: PathBuf,
+
+        #[arg(long, default_value_t = 500)]
+        match_length: usize,
+
+        #[arg(long, default_value_t=2)]
+        rep_count: usize        
+    },    
+
+    #[clap(arg_required_else_help = true)]
+    SaMergeMatches {
+        #[arg(required = true, long)]
+        storage_dir: PathBuf,
+    },
+
+    #[clap(arg_required_else_help = true)]
+    SaAnnotate {
+        #[arg(required = true, long)]
+        input_dir: PathBuf,
+
+        #[arg(required = true, long)]
+        storage_dir: PathBuf,
+
+        #[arg(required = true, long)]
+        output_dir: PathBuf,
+
+        #[arg(required = true, long)]
+        annotate_key: String,
+
+        #[arg(long)]
+        text_key: Option<String>,
+    },
+
+    #[clap(arg_required_else_help = true)]
+    SaAlt {
+        #[arg(required = true, long)]
+        text: PathBuf,
+
+        #[arg(required = true, long)]
+        offset: PathBuf,        
+
+        #[arg(required = true, long)]
+        sa_table: PathBuf,
+
+        #[arg(long, default_value_t = 500)]
+        match_length: usize,
+    },
 }
 
 /*=================================================================
@@ -897,6 +994,50 @@ fn main() {
             id_offset.clone(),
             delete_while_cleaning.clone(),
         ),
+        Commands::SaMakeTables {
+            input_dir,
+            output_dir,
+            config,
+            file_map,
+            tokenizer,
+            max_lines_per_path,
+            text_key,
+            batch_size
+        } => make_sa_tables_cmd(
+            input_dir,
+            output_dir,
+            config.clone(),
+            file_map.clone(),
+            tokenizer.clone(),
+            max_lines_per_path.clone(),
+            text_key.clone(),
+            *batch_size
+        ),
+
+        Commands::SaGetMatchesSerial {
+            storage_dir,
+            match_length,
+            rep_count,
+        } => get_matches_serial(storage_dir, *match_length, *rep_count),
+
+        Commands::SaGetMatchesParallel {
+            storage_dir,
+            match_length,
+            rep_count, 
+        } => get_matches_parallel(storage_dir, *match_length, *rep_count),        
+
+        Commands::SaMergeMatches {
+            storage_dir,            
+        } => merge_matches(storage_dir),
+
+        Commands::SaAnnotate {
+            input_dir,
+            storage_dir,
+            output_dir,
+            annotate_key,
+            text_key,
+        } => sa_annotate_files(input_dir, storage_dir, output_dir, annotate_key, text_key.clone()),
+
 
         _ => Ok(()),
     };
